@@ -302,10 +302,23 @@ function escapeHtml(str) {
 // ─── Puppeteer launcher ───────────────────────────────────────────────────────
 
 async function launchBrowser() {
-  let executablePath
-  try {
-    executablePath = await chromium.executablePath()
-  } catch {
+  // @sparticuz/chromium bundles a prebuilt Linux x86-64 binary — it's built
+  // for the VPS/Lambda-style Linux target, and chromium.executablePath()
+  // happily resolves to it on any OS (it doesn't check whether the binary
+  // can actually run here). Spawning that ELF binary on macOS/Windows fails
+  // with ENOEXEC, not a catchable "not found" error, so the old try/catch
+  // around executablePath() never reached the local-Chrome fallback below.
+  // Only trust it on the platform it was actually built for.
+  let executablePath = null
+  if (process.platform === 'linux') {
+    try {
+      executablePath = await chromium.executablePath()
+    } catch {
+      executablePath = null
+    }
+  }
+
+  if (!executablePath) {
     const localPaths = [
       '/usr/bin/google-chrome',
       '/usr/bin/chromium-browser',
@@ -314,9 +327,12 @@ async function launchBrowser() {
     ]
     executablePath = localPaths.find(p => fs.existsSync(p)) || null
   }
+  if (!executablePath) {
+    throw new Error('No usable Chromium/Chrome executable found for this platform.')
+  }
 
   return puppeteer.launch({
-    args: chromium.args,
+    args: process.platform === 'linux' ? chromium.args : [],
     defaultViewport: chromium.defaultViewport,
     executablePath,
     headless: chromium.headless ?? true,

@@ -7,9 +7,9 @@
 const JPWEB_BASE_URL = 'https://haflaway.com'
 
 const TICKET_TYPE_BY_PARTY_TYPE = {
-  individual: 'Single',
-  couple: 'Double',
-  family: 'Family',
+  individual: 'SINGLE',
+  couple: 'DOUBLE',
+  family: 'FAMILY',
 }
 
 function resolvePartyType(attendee) {
@@ -19,7 +19,7 @@ function resolvePartyType(attendee) {
 }
 
 function resolveTicketType(attendee) {
-  return TICKET_TYPE_BY_PARTY_TYPE[resolvePartyType(attendee)] ?? 'Single'
+  return TICKET_TYPE_BY_PARTY_TYPE[resolvePartyType(attendee)] ?? 'SINGLE'
 }
 
 function buildAttendeeData(eventId, attendee, eventLabels = []) {

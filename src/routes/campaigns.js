@@ -3,15 +3,13 @@ const { getDb, admin } = require('../firebase')
 const { requireAuth } = require('../middleware/auth')
 const { requireEventAccess } = require('../middleware/eventAccess')
 const { renderAttendeeCard } = require('../render/renderAttendeeCard')
+const { sendWhatsAppCard } = require('../dispatch/whatsapp')
+const { sendSmsCard, getActiveSmsProvider, resolveEventTokens, refineMessage, SUPPORTED_SMS_PROVIDERS, SMS_CHARS_PER_SEGMENT } = require('../dispatch/sms')
+const { resolveBillingAccount, chargeBilling } = require('../dispatch/billing')
+const { getEventPlan, baseDispatchCost, quotaKeyForCampaignType, quotaForCampaign } = require('../dispatch/pricing')
+const { resolveSenderIdForEvent } = require('../dispatch/senderId')
 
 const router = express.Router()
-
-// The existing, already-deployed, already billing/quota-aware Cloud Functions
-// that actually talk to Twilio/SMS providers. This server renders the card;
-// dispatch stays here rather than being reimplemented (and re-risking the
-// billing logic) a second time.
-const WSP_URL = 'https://sendwhatsappinvitationmessages-frbu33fema-uc.a.run.app'
-const SMS_URL = 'https://sendsmsaction-frbu33fema-uc.a.run.app'
 
 // Maps a card purpose to the pre-approved WhatsApp Content Template category
 // used to send it (mirrors EventMessages.vue's CAMPAIGN_TEMPLATE_CATEGORIES).
@@ -27,8 +25,8 @@ const WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE = {
 }
 
 // SMS has no such thing as "attach an image" — the card can only ever be a
-// link in the text. These are placeholder defaults (using the same {{card}}/
-// {{eventname}}/{{date}} tokens refineMessage() already supports) used only
+// link in the text. These are placeholder defaults (refineMessage() from
+// dispatch/messageTokens.js substitutes the full {{token}} set) used only
 // when the campaign doc itself has no smsMessage set — which is always true
 // today, since the Send drawer never shows a composer for card campaigns.
 const DEFAULT_SMS_CONTENT_BY_PURPOSE = {
@@ -50,33 +48,166 @@ async function findWhatsAppTemplateId(purpose, language) {
   return snap.docs[0].id
 }
 
-async function dispatchOne({ channel, eventId, campaignId, purpose, attendeeId, uid, whatsappTemplateId, smsContent }) {
-  const url = channel === 'whatsapp' ? WSP_URL : SMS_URL
-  const body = channel === 'whatsapp'
-    ? { templateId: whatsappTemplateId, type: campaignId, eventId, attendeesIds: [attendeeId], kardType: purpose }
-    : { content: smsContent, type: campaignId, eventId, attendeesIds: [attendeeId], kardType: purpose }
+// Sends one attendee's card and logs it — ported from functions/whatsapp/
+// invitation.js + functions/sms/indesms.js (origin/messaging), talking to
+// Twilio/Beem/OnFon/Wasambazie directly instead of proxying through those
+// Cloud Functions. messageLogs docs are written in the exact same shape
+// those functions write, so the still-deployed delivery-status webhooks
+// (updtWspMsgSttsAction, reportOnFons, reportWasambazie) keep updating
+// attendee.messages/messageIndexes unchanged.
+//
+// Billing quota here is a per-(channel,campaignId) COUNTER FIELD on the
+// attendee doc (`${channel}_${campaignId}_count`), incremented in the same
+// batch as the messageLog write — NOT a filter over the attendee.messages
+// map (that map is purely for display/status, populated asynchronously by
+// the webhooks above). Only the five fixed lifecycle campaign ids have a
+// free-dispatch quota at all (see dispatch/pricing.js); every other
+// campaignId — which includes every card-send campaign this server's own
+// Send-a-Card flow creates — is "custom" and is always charged.
+async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId, whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId }) {
+  const attendeeRef = db.collection('events').doc(event.id).collection('attendees').doc(attendeeId)
+  const attendeeSnap = await attendeeRef.get()
+  if (!attendeeSnap.exists) throw new Error('Attendee not found.')
+  const attendee = { id: attendeeSnap.id, ...attendeeSnap.data() }
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${uid}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  const data = await res.json()
-  if (!res.ok || data.status !== true) {
-    throw new Error(data.message || `Dispatch failed (HTTP ${res.status}).`)
+  if (!attendee.phone || !attendee.fullName) {
+    throw new Error('Skipped — missing phone or name.')
   }
-  // A batch-of-one call can still come back status:true with this one
-  // recipient reported as skipped/failed inside `details` — don't count
-  // that as success.
-  const failure = data.details?.failures?.[0]
-  if (failure) throw new Error(failure.error || failure.reason || 'Dispatch failed.')
+  if (!attendee.cards?.[purpose]?.url) {
+    throw new Error('Skipped — missing rendered card.')
+  }
+  const cardUrl = attendee.cards[purpose].url
+  const cardName = attendee.cards[purpose].name
+
+  const quotaKey = quotaKeyForCampaignType(campaignId)
+  const isCustomCampaign = quotaKey === null
+  const counterField = `${channel}_${campaignId}_count`
+  const currentCount = attendee[counterField] ?? 0
+  const shouldCharge = isCustomCampaign || (currentCount >= quotaForCampaign(eventPlan, channel, quotaKey))
+
+  // Check affordability BEFORE spending real money on an actual provider
+  // call — chargeBilling() re-checks atomically after the send too, but that
+  // re-check only prevents the balance from going negative; by then the
+  // message has already gone out for real. Failing here instead means a
+  // chargeable send with insufficient balance costs nothing and sends
+  // nothing, rather than sending for free and reporting a confusing failure.
+  async function assertAffordable(amount) {
+    if (amount <= 0) return
+    if (typeof billing.balance !== 'number' || billing.balance < amount) {
+      throw new Error(`Insufficient balance to send this ${channel} message (needs ${amount}).`)
+    }
+  }
+
+  if (channel === 'whatsapp') {
+    const chargeAmount = shouldCharge ? baseDispatchCost(eventPlan, 'whatsapp') : 0
+    await assertAffordable(chargeAmount)
+
+    const result = await sendWhatsAppCard({ event, attendee, cardUrl, templateId: whatsappTemplateId, customMessage: whatsappCustomMessage })
+    const batch = db.batch()
+    batch.set(db.collection('messageLogs').doc(result.sid), {
+      type: campaignId,
+      channel: 'whatsapp',
+      attendeeId,
+      eventId: event.id,
+      authorId: event.authorId,
+      dispatchedBy: requestedBy,
+      from: result.from,
+      to: result.to,
+      accountSid: result.accountSid,
+      status: result.status,
+      dateCreated: result.dateCreated,
+      dateUpdated: result.dateUpdated,
+      templateId: whatsappTemplateId,
+      sentContentVariables: result.sentContentVariables,
+      chargeAmount,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true })
+    batch.update(attendeeRef, { [counterField]: admin.firestore.FieldValue.increment(1) })
+    await batch.commit()
+
+    if (chargeAmount > 0) {
+      await chargeBilling({
+        billing, authorId: event.authorId, eventId: event.id, attendeeId,
+        amount: chargeAmount,
+        reason: isCustomCampaign
+          ? `Sent WhatsApp message — custom campaign (${campaignId})`
+          : `Sent WhatsApp message via Overdraft (${campaignId})`,
+        extraParams: { channel: 'whatsapp', campaignType: campaignId, quotaKey, countAtSend: currentCount },
+      })
+    }
+    return
+  }
+
+  // sms — cost depends on the final message's segment count, so it's only
+  // knowable (and checked) once the template's been substituted.
+  const eventTokens = resolveEventTokens(event)
+  const message = refineMessage(event.id, attendee.fullName, attendee.id, smsTemplate, cardUrl, cardName, attendee.pledgedAmount ?? 0, attendee.paidAmount ?? 0, eventTokens)
+  const segments = Math.ceil(message.length / SMS_CHARS_PER_SEGMENT)
+  const chargeAmount = shouldCharge ? baseDispatchCost(eventPlan, 'sms') * segments : 0
+  await assertAffordable(chargeAmount)
+
+  const providerName = await getActiveSmsProvider(db)
+  const result = await sendSmsCard({ providerName, message, attendeeId, phoneNumber: attendee.phone, senderId, orgId: event.orgId })
+
+  const batch = db.batch()
+  batch.set(db.collection('messageLogs').doc(result.requestId), {
+    type: campaignId,
+    channel: 'sms',
+    attendeeId,
+    eventId: event.id,
+    authorId: event.authorId,
+    dispatchedBy: requestedBy,
+    message,
+    from: senderId,
+    to: attendee.phone,
+    status: 'submitted',
+    apiProvider: providerName,
+    apiResponseCode: result.code ?? null,
+    apiResponseMessage: result.message ?? null,
+    apiRequestTimestamp: new Date().toISOString(),
+    dateCreated: new Date().toISOString(),
+    requestId: result.requestId,
+    segments,
+    baseSMSCharge: baseDispatchCost(eventPlan, 'sms'),
+    chargeAmount,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: false })
+  const msgInd = attendee.messageIndexes ?? []
+  batch.update(attendeeRef, {
+    messageIndexes: [
+      ...msgInd.filter(i => !i.startsWith(`sms_${campaignId}`)),
+      `sms_${campaignId}_sent`,
+    ],
+    [counterField]: admin.firestore.FieldValue.increment(1),
+  })
+  await batch.commit()
+
+  if (chargeAmount > 0) {
+    await chargeBilling({
+      billing, authorId: event.authorId, eventId: event.id, attendeeId,
+      amount: chargeAmount,
+      reason: isCustomCampaign
+        ? `SMS dispatch charge — custom campaign (${campaignId})`
+        : `SMS dispatch charge via Overdraft (${campaignId})`,
+      extraParams: { channel: 'sms', campaignType: campaignId, quotaKey, countAtSend: currentCount, messageLength: message.length, messageSegments: segments },
+    })
+  }
 }
 
 async function bumpRun(runRef, countKey, attendeeId, entry) {
-  await runRef.update({
-    [`results.${attendeeId}`]: entry,
-    [`counts.${countKey}`]: admin.firestore.FieldValue.increment(1),
-  })
+  try {
+    await runRef.update({
+      [`results.${attendeeId}`]: entry,
+      [`counts.${countKey}`]: admin.firestore.FieldValue.increment(1),
+    })
+  } catch (e) {
+    // The message itself already succeeded/failed for real by this point —
+    // a failure to record that in the run doc must never flip a successful,
+    // already-billed send into looking like a failure (which would invite a
+    // costly, duplicate retry). Just log it; the sendRuns doc's count will
+    // undercount by one, which is a display nit, not a billing one.
+    console.error(`bumpRun(${countKey}, ${attendeeId}) failed:`, e)
+  }
 }
 
 // Sequential, one attendee at a time, continuing past failures — the
@@ -85,65 +216,110 @@ async function bumpRun(runRef, countKey, attendeeId, entry) {
 // already gone out; this is a persistent VPS process, not a Cloud Function
 // with an execution-time ceiling, so it's safe to keep going in the
 // background. Progress streams to the SPA live via the sendRuns doc.
-async function processRun({ db, runRef, eventId, campaignId, channel, purpose, attendeeIds, uid }) {
-  let whatsappTemplateId = null
-  let smsContent = DEFAULT_SMS_CONTENT_BY_PURPOSE[purpose] ?? ''
+//
+// finishedAt is always stamped in a finally, no matter what happens in the
+// loop — the in-flight lock on this campaign (see the route handler below)
+// is a `where finishedAt == null` query, so leaving it unset on any
+// unexpected crash would lock the campaign out of ever sending again.
+async function processRun({ db, runRef, eventId, campaignId, channel, purpose, attendeeIds, templateId, requestedBy }) {
+  let whatsappTemplateId = templateId || null
+  let smsTemplate = DEFAULT_SMS_CONTENT_BY_PURPOSE[purpose] ?? ''
+  let whatsappCustomMessage = ''
   let setupError = null
+  let event = null
+  let eventPlan = null
+  let billing = null
+  let senderId = null
 
   try {
     const [eventSnap, campaignSnap] = await Promise.all([
       db.collection('events').doc(eventId).get(),
       db.collection('events').doc(eventId).collection('campaigns').doc(campaignId).get(),
     ])
-    const language = eventSnap.data()?.language ?? 'sw'
-    if (campaignSnap.data()?.smsMessage) smsContent = campaignSnap.data().smsMessage
-    if (channel === 'whatsapp') {
+    event = { id: eventId, ...eventSnap.data() }
+    const language = event.language ?? 'sw'
+    const campaignData = campaignSnap.data() ?? {}
+    if (campaignData.smsMessage) smsTemplate = campaignData.smsMessage
+    if (campaignData.whatsappMessage) whatsappCustomMessage = campaignData.whatsappMessage
+
+    if (channel === 'sms') {
+      // Fail the whole run up front if the event's active SMS provider has no
+      // adapter here, rather than rendering (and billing) every attendee's
+      // card first and only discovering this per-attendee afterward.
+      const providerName = await getActiveSmsProvider(db)
+      if (!SUPPORTED_SMS_PROVIDERS.has(providerName)) {
+        throw new Error(`SMS provider "${providerName}" has no adapter in haflaway_server yet.`)
+      }
+      senderId = await resolveSenderIdForEvent(event)
+    }
+    // A caller that already knows which approved template it wants (e.g. the
+    // SPA's own template picker) can pass templateId directly — only fall
+    // back to resolving one by purpose/language when it didn't.
+    if (channel === 'whatsapp' && !whatsappTemplateId) {
       whatsappTemplateId = await findWhatsAppTemplateId(purpose, language)
     }
+    eventPlan = await getEventPlan(event)
+    baseDispatchCost(eventPlan, channel) // throws early if pricing.base* is missing for this channel
+    billing = await resolveBillingAccount(event)
   } catch (e) {
-    // Every attendee would fail identically without a usable template —
-    // record that per-attendee below instead of aborting the whole run.
     setupError = e
     console.error(`processRun setup failed for ${runRef.path}:`, e)
   }
 
-  for (const attendeeId of attendeeIds) {
-    try {
-      await renderAttendeeCard(eventId, attendeeId, purpose)
-    } catch (e) {
-      await bumpRun(runRef, 'renderFailed', attendeeId, {
-        status: 'render_failed', error: e.message, at: new Date().toISOString(),
-      })
-      continue
-    }
+  try {
+    for (const attendeeId of attendeeIds) {
+      // Setup failed entirely (bad template/provider/pricing config) —
+      // nothing downstream of it can possibly succeed, so don't waste a
+      // render (and its charge) on every attendee only to fail at send time.
+      if (setupError) {
+        await bumpRun(runRef, 'sendFailed', attendeeId, {
+          status: 'send_failed', error: setupError.message, at: new Date().toISOString(),
+        })
+        continue
+      }
 
-    try {
-      if (setupError) throw setupError
-      await dispatchOne({ channel, eventId, campaignId, purpose, attendeeId, uid, whatsappTemplateId, smsContent })
+      try {
+        await renderAttendeeCard(eventId, attendeeId, purpose)
+      } catch (e) {
+        await bumpRun(runRef, 'renderFailed', attendeeId, {
+          status: 'render_failed', error: e.message, at: new Date().toISOString(),
+        })
+        continue
+      }
+
+      try {
+        await dispatchAndLog({
+          db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId,
+          whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId,
+        })
+      } catch (e) {
+        await bumpRun(runRef, 'sendFailed', attendeeId, {
+          status: 'send_failed', error: e.message, at: new Date().toISOString(),
+        })
+        continue
+      }
+      // Recorded outside the send's own try/catch — a failure here must
+      // never reclassify an already-sent, already-billed message as failed.
       await bumpRun(runRef, 'sent', attendeeId, { status: 'sent', at: new Date().toISOString() })
-    } catch (e) {
-      await bumpRun(runRef, 'sendFailed', attendeeId, {
-        status: 'send_failed', error: e.message, at: new Date().toISOString(),
-      })
     }
-  }
-
-  const finalSnap = await runRef.get()
-  const finalCounts = finalSnap.data()?.counts ?? {}
-  await runRef.update({ finishedAt: new Date().toISOString() })
-  // Only claim "sent" if at least one recipient actually got dispatched — a
-  // 100%-failed run (e.g. no approved WhatsApp template for this purpose)
-  // should stay visibly distinguishable from a real send, not look identical
-  // to one in the campaign list.
-  if ((finalCounts.sent ?? 0) > 0) {
-    await db.collection('events').doc(eventId).collection('campaigns').doc(campaignId)
-      .set({ status: 'sent' }, { merge: true })
+  } finally {
+    const finalSnap = await runRef.get()
+    const finalCounts = finalSnap.data()?.counts ?? {}
+    await runRef.update({ finishedAt: new Date().toISOString() })
+    // Only claim "sent" if at least one recipient actually got dispatched —
+    // a 100%-failed run (e.g. no approved WhatsApp template for this
+    // purpose) should stay visibly distinguishable from a real send, not
+    // look identical to one in the campaign list.
+    if ((finalCounts.sent ?? 0) > 0) {
+      await db.collection('events').doc(eventId).collection('campaigns').doc(campaignId)
+        .set({ status: 'sent' }, { merge: true })
+    }
   }
 }
 
 router.post('/events/:eventId/campaigns/:campaignId/send', requireAuth, requireEventAccess, async (req, res) => {
   const { eventId, campaignId } = req.params
-  const { attendeeIds, channel, purpose } = req.body || {}
+  const { attendeeIds, channel, purpose, templateId } = req.body || {}
 
   if (!Array.isArray(attendeeIds) || !attendeeIds.length) {
     return res.status(400).json({ ok: false, message: 'attendeeIds must be a non-empty array.' })
@@ -196,7 +372,7 @@ router.post('/events/:eventId/campaigns/:campaignId/send', requireAuth, requireE
 
   res.json({ ok: true, runId: runRef.id })
 
-  processRun({ db, runRef, eventId, campaignId, channel, purpose, attendeeIds, uid: req.uid })
+  processRun({ db, runRef, eventId, campaignId, channel, purpose, attendeeIds, templateId, requestedBy: req.uid })
     .catch(e => console.error(`sendRuns/${runRef.id} crashed:`, e))
 })
 
