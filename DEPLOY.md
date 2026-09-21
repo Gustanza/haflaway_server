@@ -14,16 +14,17 @@ work that fits a persistent VPS process far better than a serverless function.
 It talks to Firestore/Storage directly via the Firebase Admin SDK (same
 project as the rest of Haflaway: `haflaway-f14aa`).
 
-**Rendering moved here. Dispatch did not.** Actually sending the WhatsApp/SMS
-message still goes through the existing, already-deployed, already
-billing/quota-aware Firebase Functions
-(`sendWhatsAppInvitationMessages`, `sendSMSAction` — see
-`functions/whatsapp/invitation.js`, `functions/sms/indesms.js`, a *separate*
-git repo checked out at `../functions` relative to this one). This server
-renders a card, then calls those existing endpoints once per recipient. Do
-not "finish the migration" by reimplementing Twilio/SMS-provider dispatch
-here — that duplicates real billing logic and is a large, deliberate
-non-goal of this design.
+**Rendering AND dispatch both happen here now.** This started as
+render-only, proxying actual sends through the existing Firebase Functions
+— that's no longer the case. `src/dispatch/` (`whatsapp.js`, `sms.js`,
+`billing.js`, `pricing.js`, `senderId.js`) now calls Twilio/Beem/OnFon/Smtz/
+Wasambazie directly, carefully ported from `functions/whatsapp/invitation.js`
+and `functions/sms/indesms.js` (a *separate* git repo checked out at
+`../functions` relative to this one) — same billing/quota model, same
+`messageLogs` doc shape (so the existing delivery-status webhooks there keep
+working unchanged). **This means real provider credentials must be
+configured on this app now** (step 3 below) — without them, nothing sends,
+regardless of how correctly everything else is deployed.
 
 The admin panel SPA (`haflaway_spa/`) calls this server directly from the
 browser, from `src/views/event/EventCampaigns.vue` — search that file for
@@ -34,12 +35,13 @@ browser, from `src/views/event/EventCampaigns.vue` — search that file for
 These are documented in full in `server/README.md`'s "Known gaps" section —
 read that too. The one that matters most for deployment:
 
-- **WhatsApp card sends are very likely broken right now**, independent of
-  anything in this app — a pre-existing bug in `functions/whatsapp/invitation.js`
-  (`cardUrl.split(".app/")[1]`) returns `undefined` for the actual card URLs
-  this pipeline produces (confirmed against the real bucket,
-  `haflaway-f14aa.appspot.com` — that string doesn't contain `.app/`).
-  **Test with SMS first**, not WhatsApp, until that's resolved.
+- The real Storage bucket is `haflaway-f14aa.firebasestorage.app` (confirmed
+  against an actual already-rendered card URL in Firestore) — an earlier
+  guess used the legacy `.appspot.com` domain, which doesn't exist for this
+  project and broke every render. Already fixed in `.env`/`.env.example`;
+  mentioned here so it isn't reintroduced. This also cleared up an earlier
+  false alarm about WhatsApp card sends being broken — that concern was
+  based on the same wrong bucket guess and doesn't actually apply.
 - Only `invitation` and `save_the_date` have a real WhatsApp template category
   configured (`thank_you`/`enclosure` don't yet).
 - `requireEventAccess` (in `src/middleware/eventAccess.js`) only checks
@@ -153,10 +155,20 @@ Fill in / confirm:
 - `GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json` (default is fine
   if you scp'd the key to the same directory)
 - `FIREBASE_PROJECT_ID=haflaway-f14aa`
-- `FIREBASE_STORAGE_BUCKET=haflaway-f14aa.appspot.com`
+- `FIREBASE_STORAGE_BUCKET=haflaway-f14aa.firebasestorage.app` (confirmed
+  against real data — see `.env.example`'s comment; don't change without
+  re-verifying against an actual `cards.*.url` value in Firestore)
 - `CARD_SERVER_VPS_CORES=<the real number from `nproc` in step 1>`
 - `PORT=8080` (fine to leave — it stays behind the reverse proxy in step 6,
   never exposed directly to the internet)
+- **`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_NUMBER`,
+  `BEEM_API_KEY`, `BEEM_SECRET_KEY`, `ONFON_USERNAME`, `ONFON_PASSWORD`,
+  `SMTZ_API_KEY`, `WASAMBAZIE_PUBLIC_KEY`, `WASAMBAZIE_SECRET_KEY`** — real
+  values live in `functions/utils/constants.js` and
+  `functions/sms/{beem,onfon,smtz,wasambazie}.js`. These are live credentials
+  same as the service account key — copy them directly into `.env` on the
+  VPS, never through a commit, never pasted into a chat session. Without
+  these, rendering still works but every dispatch attempt fails.
 
 ## 4. Install dependencies
 
@@ -316,9 +328,7 @@ effect.
    `render_failed` or `send_failed`.
 4. Check `pm2 logs haflaway-card-server` on the VPS for anything unexpected
    during that request.
-5. Only after that works: try WhatsApp, ideally after confirming the
-   `.app/` split bug above has actually been fixed or is a non-issue for
-   your Twilio Content Template's real contract.
+5. Only after that works: try WhatsApp.
 
 Do not run a real batch send to actual event guests until this single-
 recipient SMS test has succeeded.

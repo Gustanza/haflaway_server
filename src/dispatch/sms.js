@@ -4,9 +4,9 @@
 // webhooks (reportOnFons, reportWasambazie, reportSmtz — still deployed) keep
 // working unchanged — they only need a messageLogs/{requestId} doc with the
 // right fields.
-const { getDb } = require('../firebase')
 const { resolveEventTokens, refineMessage } = require('./messageTokens')
 const { DEFAULT_SENDER_ID } = require('./senderId')
+const { getCredentials } = require('../organizations/smsCredentials')
 
 // Standard SMS segment size (GSM-7 encoding, matches baseSMS pricing unit) —
 // 160, not the 153 a stale copy of this logic used (153 only applies to
@@ -115,23 +115,19 @@ async function getActiveSmsProvider(db) {
 
 const SUPPORTED_SMS_PROVIDERS = new Set(['beem', 'onfonmedia', 'wasambazie', 'smtz'])
 
-// smtz/wasambazie credentials are configurable per-organization from the
-// SMS Providers tab in OrganizationSettings.vue (written server-side by the
-// setOrgSmsCredentials callable in functions/organizations/smsCredentials.js,
-// under organizations/{orgId}/smsCredentials/{provider}). An org that hasn't
-// configured its own falls back to the platform default — same behavior as
-// before this was configurable, so existing orgs aren't disrupted by this
-// rolling out. A lookup failure (bad orgId, Firestore hiccup) degrades to the
-// default rather than blocking the send, mirroring resolveSenderIdForEvent.
+// smtz/wasambazie credentials are configurable per-organization from the SMS
+// Providers tab in OrganizationSettings.vue (owner brings their own account,
+// created directly with that provider — see organizations/smsCredentials.js
+// for the write path). An org that hasn't configured its own falls back to
+// the platform default, so unplugging an org's credentials reverts its very
+// next send to Haflaway's shared account with no other action needed. A
+// lookup failure (bad orgId, Firestore hiccup) also degrades to the default
+// rather than blocking the send, mirroring resolveSenderIdForEvent.
 async function resolveOrgSmsCredentials(orgId, providerName) {
   if (orgId) {
     try {
-      const snap = await getDb()
-        .collection('organizations').doc(orgId)
-        .collection('smsCredentials').doc(providerName)
-        .get()
-      if (snap.exists) {
-        const data = snap.data()
+      const data = await getCredentials(orgId, providerName)
+      if (data) {
         if (providerName === 'smtz' && data.apiKey) {
           return { apiKey: data.apiKey }
         }

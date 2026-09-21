@@ -7,7 +7,8 @@ const { sendWhatsAppCard } = require('../dispatch/whatsapp')
 const { sendSmsCard, getActiveSmsProvider, resolveEventTokens, refineMessage, SUPPORTED_SMS_PROVIDERS, SMS_CHARS_PER_SEGMENT } = require('../dispatch/sms')
 const { resolveBillingAccount, chargeBilling } = require('../dispatch/billing')
 const { getEventPlan, baseDispatchCost, quotaKeyForCampaignType, quotaForCampaign } = require('../dispatch/pricing')
-const { resolveSenderIdForEvent } = require('../dispatch/senderId')
+const { resolveSenderIdForEvent, normalizeSenderId } = require('../dispatch/senderId')
+const { getSenderPool, resolveProviderForOrg } = require('../organizations/smsCredentials')
 
 const router = express.Router()
 
@@ -64,7 +65,7 @@ async function findWhatsAppTemplateId(purpose, language) {
 // free-dispatch quota at all (see dispatch/pricing.js); every other
 // campaignId — which includes every card-send campaign this server's own
 // Send-a-Card flow creates — is "custom" and is always charged.
-async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId, whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId }) {
+async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId, whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId, smsProviderName }) {
   const attendeeRef = db.collection('events').doc(event.id).collection('attendees').doc(attendeeId)
   const attendeeSnap = await attendeeRef.get()
   if (!attendeeSnap.exists) throw new Error('Attendee not found.')
@@ -73,11 +74,19 @@ async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpo
   if (!attendee.phone || !attendee.fullName) {
     throw new Error('Skipped — missing phone or name.')
   }
-  if (!attendee.cards?.[purpose]?.url) {
-    throw new Error('Skipped — missing rendered card.')
+
+  // A plain SMS text blast has no purpose and no card at all — cardUrl/
+  // cardName just stay undefined, and refineMessage()/{{card}} substitution
+  // downstream already tolerates that. WhatsApp always has a purpose (see
+  // the route's validation), so it keeps requiring a rendered card here.
+  let cardUrl, cardName
+  if (purpose) {
+    if (!attendee.cards?.[purpose]?.url) {
+      throw new Error('Skipped — missing rendered card.')
+    }
+    cardUrl = attendee.cards[purpose].url
+    cardName = attendee.cards[purpose].name
   }
-  const cardUrl = attendee.cards[purpose].url
-  const cardName = attendee.cards[purpose].name
 
   const quotaKey = quotaKeyForCampaignType(campaignId)
   const isCustomCampaign = quotaKey === null
@@ -146,8 +155,7 @@ async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpo
   const chargeAmount = shouldCharge ? baseDispatchCost(eventPlan, 'sms') * segments : 0
   await assertAffordable(chargeAmount)
 
-  const providerName = await getActiveSmsProvider(db)
-  const result = await sendSmsCard({ providerName, message, attendeeId, phoneNumber: attendee.phone, senderId, orgId: event.orgId })
+  const result = await sendSmsCard({ providerName: smsProviderName, message, attendeeId, phoneNumber: attendee.phone, senderId, orgId: event.orgId })
 
   const batch = db.batch()
   batch.set(db.collection('messageLogs').doc(result.requestId), {
@@ -161,7 +169,7 @@ async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpo
     from: senderId,
     to: attendee.phone,
     status: 'submitted',
-    apiProvider: providerName,
+    apiProvider: smsProviderName,
     apiResponseCode: result.code ?? null,
     apiResponseMessage: result.message ?? null,
     apiRequestTimestamp: new Date().toISOString(),
@@ -230,6 +238,7 @@ async function processRun({ db, runRef, eventId, campaignId, channel, purpose, a
   let eventPlan = null
   let billing = null
   let senderId = null
+  let smsProviderName = null
 
   try {
     const [eventSnap, campaignSnap] = await Promise.all([
@@ -243,14 +252,30 @@ async function processRun({ db, runRef, eventId, campaignId, channel, purpose, a
     if (campaignData.whatsappMessage) whatsappCustomMessage = campaignData.whatsappMessage
 
     if (channel === 'sms') {
-      // Fail the whole run up front if the event's active SMS provider has no
-      // adapter here, rather than rendering (and billing) every attendee's
-      // card first and only discovering this per-attendee afterward.
-      const providerName = await getActiveSmsProvider(db)
-      if (!SUPPORTED_SMS_PROVIDERS.has(providerName)) {
-        throw new Error(`SMS provider "${providerName}" has no adapter in haflaway_server yet.`)
+      // A plain text blast (no purpose/card) has no default fallback content
+      // of its own — its whole message has to come from the campaign doc's
+      // smsMessage field, composed by the org in the Send drawer. A
+      // purpose-based send always has DEFAULT_SMS_CONTENT_BY_PURPOSE to fall
+      // back on even if smsMessage was never set.
+      if (!purpose && !smsTemplate.trim()) {
+        throw new Error('This campaign has no message content set.')
       }
-      senderId = await resolveSenderIdForEvent(event)
+      // An org that's plugged in its own smtz/wasambazie credentials always
+      // sends through that provider on their own account — the platform-wide
+      // active-provider switch (getActiveSmsProvider) only decides for an
+      // org that hasn't brought anything of its own. Resolved once per batch
+      // and threaded through to every dispatchAndLog call below so sender-ID
+      // resolution and the actual send can never disagree about which
+      // provider this batch is using.
+      const platformProvider = await getActiveSmsProvider(db)
+      smsProviderName = await resolveProviderForOrg(event.orgId, platformProvider)
+      // Fail the whole run up front if the resolved provider has no adapter
+      // here, rather than rendering (and billing) every attendee's card
+      // first and only discovering this per-attendee afterward.
+      if (!SUPPORTED_SMS_PROVIDERS.has(smsProviderName)) {
+        throw new Error(`SMS provider "${smsProviderName}" has no adapter in haflaway_server yet.`)
+      }
+      senderId = await resolveSenderIdForEvent(event, smsProviderName)
     }
     // A caller that already knows which approved template it wants (e.g. the
     // SPA's own template picker) can pass templateId directly — only fall
@@ -278,19 +303,23 @@ async function processRun({ db, runRef, eventId, campaignId, channel, purpose, a
         continue
       }
 
-      try {
-        await renderAttendeeCard(eventId, attendeeId, purpose)
-      } catch (e) {
-        await bumpRun(runRef, 'renderFailed', attendeeId, {
-          status: 'render_failed', error: e.message, at: new Date().toISOString(),
-        })
-        continue
+      // A plain text blast has no purpose and nothing to render — only a
+      // purpose-based send (card attached) needs this step at all.
+      if (purpose) {
+        try {
+          await renderAttendeeCard(eventId, attendeeId, purpose)
+        } catch (e) {
+          await bumpRun(runRef, 'renderFailed', attendeeId, {
+            status: 'render_failed', error: e.message, at: new Date().toISOString(),
+          })
+          continue
+        }
       }
 
       try {
         await dispatchAndLog({
           db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId,
-          whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId,
+          whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId, smsProviderName,
         })
       } catch (e) {
         await bumpRun(runRef, 'sendFailed', attendeeId, {
@@ -327,8 +356,12 @@ router.post('/events/:eventId/campaigns/:campaignId/send', requireAuth, requireE
   if (channel !== 'whatsapp' && channel !== 'sms') {
     return res.status(400).json({ ok: false, message: 'channel must be "whatsapp" or "sms".' })
   }
-  if (!purpose) {
-    return res.status(400).json({ ok: false, message: 'purpose is required.' })
+  // WhatsApp always sends via an approved Content Template tied to a purpose
+  // (see findWhatsAppTemplateId below), so it always needs one. A plain SMS
+  // text blast — no card, no purpose — is the one case that doesn't: its
+  // message comes straight from the campaign doc's own smsMessage field.
+  if (channel === 'whatsapp' && !purpose) {
+    return res.status(400).json({ ok: false, message: 'purpose is required for WhatsApp sends.' })
   }
 
   const db = getDb()
@@ -354,7 +387,10 @@ router.post('/events/:eventId/campaigns/:campaignId/send', requireAuth, requireE
         throw err
       }
       trn.set(runRef, {
-        eventId, campaignId, channel, purpose,
+        eventId, campaignId, channel,
+        // A plain SMS blast has no purpose at all — Firestore rejects
+        // `undefined` fields outright (allows `null`, not `undefined`).
+        purpose: purpose ?? null,
         total: attendeeIds.length,
         startedAt: new Date().toISOString(),
         finishedAt: null,
@@ -374,6 +410,39 @@ router.post('/events/:eventId/campaigns/:campaignId/send', requireAuth, requireE
 
   processRun({ db, runRef, eventId, campaignId, channel, purpose, attendeeIds, templateId, requestedBy: req.uid })
     .catch(e => console.error(`sendRuns/${runRef.id} crashed:`, e))
+})
+
+// Pins this event to one sender ID from its org's currently-active-provider
+// pool, or clears the pin (senderId null/'') so it follows the org default.
+// Validated here rather than trusted from the client — an event must never
+// be able to name a sender ID it doesn't actually have (its own org's, on
+// whichever provider Haflaway is currently routing through).
+router.post('/events/:eventId/sender-id', requireAuth, requireEventAccess, async (req, res) => {
+  const { senderId } = req.body || {}
+  const db = getDb()
+  const eventRef = db.collection('events').doc(req.params.eventId)
+
+  const value = normalizeSenderId(senderId)
+  if (!value) {
+    await eventRef.update({ senderId: admin.firestore.FieldValue.delete() })
+    return res.json({ ok: true, senderId: null })
+  }
+
+  const eventSnap = await eventRef.get()
+  const event = eventSnap.data()
+  if (!event?.orgId) {
+    return res.status(400).json({ ok: false, message: "This event isn't linked to an organization, so it sends under the Haflaway default." })
+  }
+
+  const platformProvider = await getActiveSmsProvider(db).catch(() => null)
+  const providerName = await resolveProviderForOrg(event.orgId, platformProvider)
+  const pool = providerName ? await getSenderPool(event.orgId, providerName) : { configured: false, senderIds: [] }
+  if (!pool.configured || !pool.senderIds.includes(value)) {
+    return res.status(400).json({ ok: false, message: `${value} isn't one of this organization's sender IDs.` })
+  }
+
+  await eventRef.update({ senderId: value })
+  res.json({ ok: true, senderId: value })
 })
 
 module.exports = router

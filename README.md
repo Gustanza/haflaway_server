@@ -29,7 +29,11 @@ cp .env.example .env
 ```
 
 Edit `.env` if your key file has a different name/location, or the storage bucket
-name differs from the default.
+name differs from the default. If you're actually dispatching (not just
+rendering), also fill in the Twilio/Beem/OnFon/Smtz/Wasambazie credentials —
+real values live in `functions/utils/constants.js` and
+`functions/sms/{beem,onfon,smtz,wasambazie}.js`. Never put real secrets in
+`.env.example` itself — it's committed.
 
 ## 3. Install & run
 
@@ -67,23 +71,24 @@ rather set it directly.
 
 ## Known gaps
 
-- **⚠️ Blocking, pre-existing, NOT introduced by this app — likely breaks every
-  WhatsApp card send today.** `functions/whatsapp/invitation.js` (and the
-  identical line in `contribution.js`) derives the WhatsApp content variable
-  for the card image via `cardUrl.split(".app/")[1]`. The card URLs this
-  server (and the untouched `functions/attendees/imagen.js`) actually produce
-  are `https://storage.googleapis.com/haflaway-f14aa.appspot.com/Level0/...`
-  — confirmed live via the real default bucket name — which does **not**
-  contain the literal substring `.app/`. Verified directly: that split
-  returns `undefined`, which trips `invitation.js`'s "Invalid cardUrl" skip
-  for every attendee, every time. This predates this build (only the
-  surrounding `if` condition changed) and affects the existing
-  invitation-lifecycle flow too, not just card-purpose campaigns — but it's
-  the linchpin for whether "send card via WhatsApp" can work at all. I did
-  **not** guess at a fix here since it depends on the actual Twilio Content
-  Template's var 6 contract (full URL? a relative Storage path? something
-  else?), which isn't visible from code — needs a real send test, or
-  confirmation of what that template variable actually expects.
+- ~~Blocking bucket-URL mismatch affecting WhatsApp sends~~ — **retracted.**
+  An earlier version of this doc flagged `functions/whatsapp/invitation.js`'s
+  `cardUrl.split(".app/")[1]` as likely broken, based on an assumed default
+  bucket of `haflaway-f14aa.appspot.com`. That assumption was wrong — see the
+  bucket-name story below — and was never checked against real data at the
+  time. The actual bucket, `haflaway-f14aa.firebasestorage.app`, **does**
+  contain `.app/` as a substring, so that split works correctly. No fix
+  needed here after all.
+- **The real Storage bucket is `haflaway-f14aa.firebasestorage.app`, not
+  `.appspot.com`.** `src/firebase.js` requires this explicitly — bucket
+  auto-detection only works inside GCP's own runtime (Cloud Functions/Run),
+  not for a service-account-authenticated app on a plain VPS. An earlier
+  guess here used the legacy `.appspot.com` domain and broke every render
+  with "The specified bucket does not exist" — caught via a real end-to-end
+  test, then confirmed against an actual already-rendered `cards.*.url`
+  value already sitting in Firestore. `.env`/`.env.example` now have the
+  correct value. If this ever needs re-verifying, don't guess — search
+  Firestore for a real `cards.*.url` field and read the bucket out of it.
 - **WhatsApp template categories for `thank_you`/`enclosure`** — dispatch
   looks up a pre-approved WhatsApp Content Template by category
   (`WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE` in `src/routes/campaigns.js`).
@@ -97,6 +102,29 @@ rather set it directly.
   the SPA (the card itself is the content), so SMS sends fall back to a
   generic per-purpose string in `DEFAULT_SMS_CONTENT_BY_PURPOSE` unless the
   campaign doc's own `smsMessage` is set. Worth customizing per event.
-- **Puppeteer/Chromium is Linux-targeted** (`@sparticuz/chromium`) — rendering
-  won't work when running this server directly on Windows; test the actual
-  render pipeline on the Linux VPS (or WSL) once deployed.
+- **Dispatch credentials aren't set anywhere yet.** `src/dispatch/{whatsapp,sms}.js`
+  now call Twilio/Beem/OnFon/Smtz/Wasambazie directly (see "Dispatch now
+  happens here too" below) instead of proxying through Cloud Functions that
+  already had these configured — nothing will actually send until the real
+  `TWILIO_*`/`BEEM_*`/`ONFON_*`/`SMTZ_*`/`WASAMBAZIE_*` values from
+  `functions/utils/constants.js` and `functions/sms/*.js` are copied into the
+  real (gitignored) `.env` on wherever this runs.
+- Puppeteer/Chromium platform handling is fixed — `launchBrowser()` in
+  `src/render/renderCard.js` now only trusts `@sparticuz/chromium`'s bundled
+  binary on Linux (it's a prebuilt ELF executable that silently fails to spawn
+  elsewhere) and correctly falls back to a local Chrome/Chromium install on
+  other platforms. Rendering should now work for local dev testing too, given
+  a real browser installed.
+
+## Dispatch now happens here too
+
+`src/dispatch/` (`whatsapp.js`, `sms.js`, `billing.js`, `pricing.js`,
+`senderId.js`, `messageTokens.js`) ports the actual Twilio/SMS-provider
+calls and billing/quota logic straight from `functions/whatsapp/invitation.js`
+and `functions/sms/indesms.js` — `src/routes/campaigns.js` no longer proxies
+through those Cloud Functions per recipient; it dispatches directly. It
+writes to the same `messageLogs` shape those functions always did, so the
+existing delivery-status webhooks keep working unchanged. Card *rendering*
+is now billed too (`src/render/renderAttendeeCard.js`), separately from
+dispatch — see that file's comments for the creation-vs-correction charging
+model (`attendee.cardRenderCounts[purpose]`).
