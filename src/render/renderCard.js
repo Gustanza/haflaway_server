@@ -324,7 +324,15 @@ async function launchBrowser() {
       '/usr/bin/chromium-browser',
       '/usr/bin/chromium',
       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    ]
+      // Windows dev machines — Chrome's per-machine and per-user install
+      // locations, then Edge (also Chromium-based, works fine with
+      // puppeteer-core's CDP protocol) as a fallback if only that's installed.
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe` : null,
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    ].filter(Boolean)
     executablePath = localPaths.find(p => fs.existsSync(p)) || null
   }
   if (!executablePath) {

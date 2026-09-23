@@ -3,27 +3,21 @@ const { getDb, admin } = require('../firebase')
 const { requireAuth } = require('../middleware/auth')
 const { requireEventAccess } = require('../middleware/eventAccess')
 const { renderAttendeeCard } = require('../render/renderAttendeeCard')
-const { sendWhatsAppCard } = require('../dispatch/whatsapp')
+const { sendWhatsAppCard, resolveOrgWhatsAppCredentials } = require('../dispatch/whatsapp')
 const { sendSmsCard, getActiveSmsProvider, resolveEventTokens, refineMessage, SUPPORTED_SMS_PROVIDERS, SMS_CHARS_PER_SEGMENT } = require('../dispatch/sms')
 const { resolveBillingAccount, chargeBilling } = require('../dispatch/billing')
 const { getEventPlan, baseDispatchCost, quotaKeyForCampaignType, quotaForCampaign } = require('../dispatch/pricing')
 const { resolveSenderIdForEvent, normalizeSenderId } = require('../dispatch/senderId')
 const { getSenderPool, resolveProviderForOrg } = require('../organizations/smsCredentials')
+const { getTemplate: getOrgWhatsAppTemplate } = require('../organizations/twilioCredentials')
+const { WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE } = require('../dispatch/whatsappTemplateCategories')
 
 const router = express.Router()
 
-// Maps a card purpose to the pre-approved WhatsApp Content Template category
-// used to send it (mirrors EventMessages.vue's CAMPAIGN_TEMPLATE_CATEGORIES).
 // Only invitation/save_the_date have a real category today — thank_you and
 // enclosure are best-guess names; sends for those two purposes will fail
 // per-recipient with a clear "no template found" error until an approved
 // template actually exists under the guessed category.
-const WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE = {
-  invitation: 'whatsapp-wedding-invitations',
-  save_the_date: 'whatsapp-wedding-save-the-date',
-  thank_you: 'whatsapp-wedding-thank-you',
-  enclosure: 'whatsapp-wedding-enclosure',
-}
 
 // SMS has no such thing as "attach an image" — the card can only ever be a
 // link in the text. These are placeholder defaults (refineMessage() from
@@ -65,7 +59,7 @@ async function findWhatsAppTemplateId(purpose, language) {
 // free-dispatch quota at all (see dispatch/pricing.js); every other
 // campaignId — which includes every card-send campaign this server's own
 // Send-a-Card flow creates — is "custom" and is always charged.
-async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId, whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId, smsProviderName }) {
+async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId, whatsappTemplateId, whatsappCustomMessage, whatsappCredentials, smsTemplate, requestedBy, senderId, smsProviderName }) {
   const attendeeRef = db.collection('events').doc(event.id).collection('attendees').doc(attendeeId)
   const attendeeSnap = await attendeeRef.get()
   if (!attendeeSnap.exists) throw new Error('Attendee not found.')
@@ -111,7 +105,7 @@ async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpo
     const chargeAmount = shouldCharge ? baseDispatchCost(eventPlan, 'whatsapp') : 0
     await assertAffordable(chargeAmount)
 
-    const result = await sendWhatsAppCard({ event, attendee, cardUrl, templateId: whatsappTemplateId, customMessage: whatsappCustomMessage })
+    const result = await sendWhatsAppCard({ event, attendee, cardUrl, templateId: whatsappTemplateId, customMessage: whatsappCustomMessage, credentials: whatsappCredentials })
     const batch = db.batch()
     batch.set(db.collection('messageLogs').doc(result.sid), {
       type: campaignId,
@@ -128,6 +122,7 @@ async function dispatchAndLog({ db, event, eventPlan, billing, campaignId, purpo
       dateUpdated: result.dateUpdated,
       templateId: whatsappTemplateId,
       sentContentVariables: result.sentContentVariables,
+      viaOrgCredentials: result.viaOrgCredentials,
       chargeAmount,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true })
@@ -231,6 +226,7 @@ async function bumpRun(runRef, countKey, attendeeId, entry) {
 // unexpected crash would lock the campaign out of ever sending again.
 async function processRun({ db, runRef, eventId, campaignId, channel, purpose, attendeeIds, templateId, requestedBy }) {
   let whatsappTemplateId = templateId || null
+  let whatsappCredentials = null
   let smsTemplate = DEFAULT_SMS_CONTENT_BY_PURPOSE[purpose] ?? ''
   let whatsappCustomMessage = ''
   let setupError = null
@@ -278,10 +274,34 @@ async function processRun({ db, runRef, eventId, campaignId, channel, purpose, a
       senderId = await resolveSenderIdForEvent(event, smsProviderName)
     }
     // A caller that already knows which approved template it wants (e.g. the
-    // SPA's own template picker) can pass templateId directly — only fall
-    // back to resolving one by purpose/language when it didn't.
-    if (channel === 'whatsapp' && !whatsappTemplateId) {
-      whatsappTemplateId = await findWhatsAppTemplateId(purpose, language)
+    // SPA's own template picker) can pass templateId directly — the SPA's
+    // picker surfaces the org's own registered template as one of the
+    // selectable options (see EventCampaigns.vue's loadSendTemplates), so
+    // that explicit pick can legitimately BE the org's own contentSid. Either
+    // way — explicitly picked or nothing passed at all (the automatic
+    // fallback) — an org's own contentSid only exists inside their own
+    // Twilio account, so it can never be paired with the shared account's
+    // credentials, or vice versa: check for that exact match (not just
+    // "no templateId was passed") before pairing org credentials with it. If
+    // the org hasn't registered a template for this exact category+language
+    // (or isn't approved, or hasn't brought its own Twilio account), or the
+    // caller picked a *different* (shared-library) contentSid, fall through
+    // entirely to Haflaway's shared template library + shared account.
+    if (channel === 'whatsapp') {
+      const category = WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE[purpose]
+      if (category && event.orgId) {
+        const [orgTemplate, orgCredentials] = await Promise.all([
+          getOrgWhatsAppTemplate(event.orgId, category, language),
+          resolveOrgWhatsAppCredentials(event.orgId),
+        ])
+        if (orgTemplate?.contentSid && orgCredentials && (!whatsappTemplateId || whatsappTemplateId === orgTemplate.contentSid)) {
+          whatsappTemplateId = orgTemplate.contentSid
+          whatsappCredentials = orgCredentials
+        }
+      }
+      if (!whatsappTemplateId) {
+        whatsappTemplateId = await findWhatsAppTemplateId(purpose, language)
+      }
     }
     eventPlan = await getEventPlan(event)
     baseDispatchCost(eventPlan, channel) // throws early if pricing.base* is missing for this channel
@@ -319,7 +339,7 @@ async function processRun({ db, runRef, eventId, campaignId, channel, purpose, a
       try {
         await dispatchAndLog({
           db, event, eventPlan, billing, campaignId, purpose, channel, attendeeId,
-          whatsappTemplateId, whatsappCustomMessage, smsTemplate, requestedBy, senderId, smsProviderName,
+          whatsappTemplateId, whatsappCustomMessage, whatsappCredentials, smsTemplate, requestedBy, senderId, smsProviderName,
         })
       } catch (e) {
         await bumpRun(runRef, 'sendFailed', attendeeId, {

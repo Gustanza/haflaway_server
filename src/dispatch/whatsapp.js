@@ -8,17 +8,52 @@
 const twilio = require('twilio')
 const { parseISO } = require('date-fns')
 const { formatEventDate, formatEventTime, refineMessage } = require('./messageTokens')
+const { getCredentials: getOrgTwilioCredentials } = require('../organizations/twilioCredentials')
 
-let client = null
-function twilioClient() {
-  if (!client) {
+// Haflaway's own shared account — Account SID + Auth Token, cached as a
+// singleton since these never change at runtime. An org's own credentials
+// (Twilio API Key + Secret, scoped to their account — see
+// organizations/twilioCredentials.js) are never cached this way: they're
+// re-read per send so unplugging/rotating them takes effect immediately.
+let platformClient = null
+function platformTwilioClient() {
+  if (!platformClient) {
     const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN } = process.env
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
       throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not set in .env.')
     }
-    client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    platformClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
   }
-  return client
+  return platformClient
+}
+
+// credentials is either null (use Haflaway's shared account) or an org's own
+// { accountSid, apiKeySid, apiKeySecret, whatsappSender } — resolved once per
+// send batch by resolveOrgWhatsAppCredentials below, gated on that org's
+// branding approval.
+function resolveTwilioClient(credentials) {
+  if (credentials?.accountSid && credentials?.apiKeySid && credentials?.apiKeySecret) {
+    return twilio(credentials.apiKeySid, credentials.apiKeySecret, { accountSid: credentials.accountSid })
+  }
+  return platformTwilioClient()
+}
+
+// An org that's plugged in its own approved Twilio credentials AND has a
+// contentSid registered for the category/language being sent always sends
+// through its own account (see routes/campaigns.js, which resolves the
+// template and the credentials together — never mixing an org's account with
+// Haflaway's contentSid or vice versa, since a contentSid only exists inside
+// the account it was approved in). Returns null (meaning "use the shared
+// account") whenever the org hasn't brought its own, isn't approved, or a
+// lookup fails — mirrors resolveOrgSmsCredentials in dispatch/sms.js.
+async function resolveOrgWhatsAppCredentials(orgId) {
+  if (!orgId) return null
+  try {
+    return await getOrgTwilioCredentials(orgId)
+  } catch (err) {
+    console.warn(`resolveOrgWhatsAppCredentials: falling back to shared account for org ${orgId}:`, err.message)
+    return null
+  }
 }
 
 // WhatsApp Content API template variables reject newlines/tabs and runs of
@@ -84,16 +119,16 @@ function buildContentVariables({ event, attendee, cardUrl, customMessage }) {
   })
 }
 
-async function sendWhatsAppCard({ event, attendee, cardUrl, templateId, customMessage }) {
+async function sendWhatsAppCard({ event, attendee, cardUrl, templateId, customMessage, credentials }) {
   const contentVariables = buildContentVariables({ event, attendee, cardUrl, customMessage })
-  const whatsappNumber = process.env.TWILIO_WHATSAPP_NUMBER
-  if (!whatsappNumber) throw new Error('TWILIO_WHATSAPP_NUMBER not set in .env.')
+  const whatsappNumber = credentials?.whatsappSender || process.env.TWILIO_WHATSAPP_NUMBER
+  if (!whatsappNumber) throw new Error('No WhatsApp sender configured (org has none, and TWILIO_WHATSAPP_NUMBER not set in .env).')
 
   // A hung connection here would otherwise stall this attendee (and the rest
   // of the run behind it) indefinitely.
   const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Twilio request timed out.')), 15000))
   const message = await Promise.race([
-    twilioClient().messages.create({
+    resolveTwilioClient(credentials).messages.create({
       from: `whatsapp:${whatsappNumber}`,
       to: `whatsapp:${attendee.phone}`,
       contentSid: templateId,
@@ -111,7 +146,45 @@ async function sendWhatsAppCard({ event, attendee, cardUrl, templateId, customMe
     dateCreated: message.dateCreated,
     dateUpdated: message.dateUpdated,
     sentContentVariables: contentVariables,
+    viaOrgCredentials: !!credentials,
   }
 }
 
-module.exports = { sendWhatsAppCard }
+// Synthetic placeholder values, not a real event/attendee — lets an org owner
+// confirm their own contentSid renders (right variable count/order) before
+// staff approval lands, without touching billing, messageLogs, or a real
+// guest. Always uses the org's own credentials (never the shared account) —
+// see getCredentialsForOwnerTest in organizations/twilioCredentials.js, which
+// deliberately skips the branding-approval gate for this one path.
+function buildTestContentVariables() {
+  return JSON.stringify({
+    '1': 'Test Guest',
+    '2': 'Sample Event',
+    '3': '1 Jan 2030',
+    '4': 'Sample Venue',
+    '5': '10:00 AM',
+    '6': 'https://example.com/sample-card.jpg',
+    '7': 'test-event/test-attendee',
+    '8': 'This is a test message from Haflaway — your template mapping is working.',
+    '9': '',
+    '10': '',
+  })
+}
+
+async function sendWhatsAppTestMessage({ credentials, contentSid, to }) {
+  if (!credentials?.whatsappSender) throw new Error('No WhatsApp sender configured for this org yet.')
+  const contentVariables = buildTestContentVariables()
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Twilio request timed out.')), 15000))
+  const message = await Promise.race([
+    resolveTwilioClient(credentials).messages.create({
+      from: `whatsapp:${credentials.whatsappSender}`,
+      to: `whatsapp:${to}`,
+      contentSid,
+      contentVariables,
+    }),
+    timeout,
+  ])
+  return { sid: message.sid, status: message.status }
+}
+
+module.exports = { sendWhatsAppCard, sendWhatsAppTestMessage, resolveOrgWhatsAppCredentials }
