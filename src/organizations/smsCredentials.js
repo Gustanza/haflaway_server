@@ -18,12 +18,13 @@
 // so there's one place that knows the storage shape.
 //
 // Consumption gate: saving credentials isn't enough on its own — an org's
-// own account (and the sender-ID pool riding on it) only actually gets used
-// once staff has approved that org's branding (organizations/{orgId}
-// .brandingApproved, the pill haflaway_admin_spa's Organizations view
-// flips). isBrandingApproved() below is checked first, before configured
-// state even matters — see getConfiguredProviders/getCredentials.
+// own account (and the sender-ID pool riding on it) is only ever used once
+// staff set this org's SMS switch to 'own' (organizations/messagingAccounts.js),
+// and dispatch/sms.js's resolveSmsRoute is the one place that decides that.
+// The reads below are deliberately ungated so that decision (and its
+// "refuse, never fall back" rule) lives in exactly one place.
 const { getDb, admin } = require('../firebase')
+const { getMessagingMode, getMessagingModes } = require('./messagingAccounts')
 
 const CREDENTIALS_SUBCOL = 'smsCredentials'
 
@@ -92,16 +93,10 @@ function isConfigured(provider, data) {
   return !!data && CREDENTIAL_FIELDS[provider].every(f => data[f])
 }
 
-// The same staff-reviewed gate OrganizationsView.vue (haflaway_admin_spa)
-// flips with its "Approved" / "Not approved" pill — organizations/{orgId}.
-// brandingApproved. Typing in valid smtz/wasambazie keys is no longer
-// sufficient on its own: an org's own credentials, and the self-service
-// sender-ID pool that rides along with them, only take effect once staff
-// has approved that org, same trust boundary as everything else that pill
-// gates. An org can still save/manage credentials and sender IDs before
-// approval (so they're ready to go the moment it lands) — this only gates
-// *consumption* (getCredentials/getConfiguredProviders below), not the CRUD
-// routes in routes/organizations.js.
+// The staff-reviewed branding gate OrganizationsView.vue (haflaway_admin_spa)
+// flips with its "Approved" / "Not approved" pill. Branding only — it no
+// longer decides which account messages go out on (the messaging switch
+// does), but the status payloads still report it for display.
 async function isBrandingApproved(orgId) {
   if (!orgId) return false
   const snap = await getDb().collection('organizations').doc(orgId).get()
@@ -110,8 +105,9 @@ async function isBrandingApproved(orgId) {
 
 // Whichever provider Haflaway currently routes SMS through platform-wide —
 // a single ops-controlled switch (organizations/{orgId} plays no part in
-// this), flipped by hand in the `smsProviders` collection. Only matters for
-// orgs that haven't brought their own account at all (see
+// this), flipped by hand in the `smsProviders` collection. Decides the
+// provider for every org on Haflaway's account; for an org on its own account
+// it only breaks the tie if it has configured both smtz and wasambazie (see
 // resolveEffectiveProvider below).
 async function getPlatformActiveProvider() {
   const snap = await getDb().collection('smsProviders').where('isActive', '==', true).limit(1).get()
@@ -119,41 +115,40 @@ async function getPlatformActiveProvider() {
 }
 
 // Which BYO-capable providers (smtz/wasambazie) this org has actually
-// configured its own credentials for — 0, 1, or 2. Branding approval gates
-// this first: an unapproved org reads as having configured nothing, no
-// matter what's saved in smsCredentials, so it can never win effective-
-// provider resolution below.
+// configured its own credentials for — 0, 1, or 2. Read errors propagate.
 async function getConfiguredProviders(orgId) {
-  if (!(await isBrandingApproved(orgId))) return []
   const snap = await getDb().collection('organizations').doc(orgId).collection(CREDENTIALS_SUBCOL).get()
   return snap.docs
     .filter(d => CREDENTIAL_FIELDS[d.id] && isConfigured(d.id, d.data()))
     .map(d => d.id)
 }
 
-// The provider (and whose account) that actually sends for this org. An org
-// that's plugged in its own credentials for a provider always sends through
-// that provider on their own account — Haflaway's platform-wide switch only
-// decides for an org that hasn't brought anything of its own ("uses
-// Haflaway directly"). If an org has configured BOTH smtz and wasambazie,
-// whichever matches the platform's current switch wins (so an ops-driven
-// platform change still reaches them); if neither matches (platform is on
-// beem/onfonmedia, which have no BYO support here), fall back to smtz, then
-// wasambazie, deterministically — arbitrary but stable, since configuring
-// both is expected to be rare.
+// Which of an org's OWN configured providers it sends through (only
+// meaningful for an org whose SMS switch is 'own'). With none configured this
+// returns the platform provider — callers on 'own' must treat an empty
+// `configuredProviders` as "refuse" before ever getting here (see
+// resolveSmsRoute in dispatch/sms.js). If an org has configured BOTH smtz and
+// wasambazie, whichever matches the platform's current switch wins (so an
+// ops-driven platform change still reaches them); if neither matches
+// (platform is on beem/onfonmedia, which have no BYO support here), fall back
+// to smtz, then wasambazie, deterministically — arbitrary but stable, since
+// configuring both is expected to be rare.
 function resolveEffectiveProvider(configuredProviders, platformActiveProvider) {
   if (!configuredProviders.length) return platformActiveProvider
   if (configuredProviders.includes(platformActiveProvider)) return platformActiveProvider
   return configuredProviders.includes('smtz') ? 'smtz' : configuredProviders[0]
 }
 
-// Firestore-backed wrapper for dispatch (routes/campaigns.js) — the pure
-// decision lives in resolveEffectiveProvider so getStatus() (which already
-// has both pieces of data loaded) doesn't need a second round trip.
+// The provider this org's SMS goes out through, per its switch: on
+// 'haflaway' the platform provider (the org's own credentials are never
+// consulted); on 'own' one of its own configured providers, or null if it has
+// none (which dispatch refuses). Used by the event sender-ID pin route; real
+// dispatch goes through resolveSmsRoute (dispatch/sms.js).
 async function resolveProviderForOrg(orgId, platformActiveProvider) {
   if (!orgId) return platformActiveProvider
+  if ((await getMessagingMode(orgId, 'sms')) !== 'own') return platformActiveProvider
   const configured = await getConfiguredProviders(orgId)
-  return resolveEffectiveProvider(configured, platformActiveProvider)
+  return configured.length ? resolveEffectiveProvider(configured, platformActiveProvider) : null
 }
 
 // Always a full replace of exactly the fields this provider needs — never a
@@ -193,26 +188,22 @@ async function clearCredentials(orgId, provider) {
 // (non-secret) sender-ID pool — so credentials can't leak back out through
 // the same read path used to render the "Configured" badge.
 async function getStatus(orgId) {
-  const [snap, brandingApproved] = await Promise.all([
+  const [snap, brandingApproved, modes] = await Promise.all([
     getDb().collection('organizations').doc(orgId).collection(CREDENTIALS_SUBCOL).get(),
     isBrandingApproved(orgId),
+    getMessagingModes(orgId),
   ])
 
   const status = {}
   for (const provider of Object.keys(CREDENTIAL_FIELDS)) {
     status[provider] = { configured: false, updatedAt: null, senderIds: [], defaultSenderId: null }
   }
-  // configuredProviders feeds activeProvider below, which is what dispatch
-  // actually uses — so it's branding-gated same as getConfiguredProviders,
-  // even though status[provider].configured (the "Configured" badge) stays
-  // a raw reflection of what's saved, so an owner can see their keys took
-  // before staff approval lands.
   const configuredProviders = []
   for (const docSnap of snap.docs) {
     if (!CREDENTIAL_FIELDS[docSnap.id]) continue
     const data = docSnap.data()
     const configured = isConfigured(docSnap.id, data)
-    if (configured && brandingApproved) configuredProviders.push(docSnap.id)
+    if (configured) configuredProviders.push(docSnap.id)
     const senderIds = sortSenderIds(data.senderIds)
     status[docSnap.id] = {
       configured,
@@ -223,26 +214,24 @@ async function getStatus(orgId) {
   }
 
   const platformActiveProvider = await getPlatformActiveProvider()
-  // The provider this org's sends actually go through right now — its own
-  // configured provider if it has one AND branding is approved, else
-  // whatever the platform switch says. `activeProvider` is the name
-  // EventSettings.vue/OrganizationSettings.vue already key their sender-ID
-  // pool off of, so it stays org-aware here rather than a raw copy of the
-  // platform switch.
-  const activeProvider = resolveEffectiveProvider(configuredProviders, platformActiveProvider)
+  // The provider this org's sends actually go through right now, per its
+  // staff-set switch (`mode`): on 'haflaway' the platform provider, on 'own'
+  // its own configured provider — or null if it has none, in which case
+  // every SMS send is refused. `activeProvider` is the name
+  // EventSettings.vue/OrganizationSettings.vue key their sender-ID pool off.
+  const mode = modes.sms
+  const activeProvider = mode === 'own'
+    ? (configuredProviders.length ? resolveEffectiveProvider(configuredProviders, platformActiveProvider) : null)
+    : platformActiveProvider
 
-  return { ...status, brandingApproved, platformActiveProvider, activeProvider }
+  return { ...status, brandingApproved, platformActiveProvider, activeProvider, mode }
 }
 
 // Internal use only (dispatch/sms.js, and getSenderPool below) — the one
-// place allowed to read the actual secret values back out. Branding-gated
-// same as getConfiguredProviders — an unapproved org reads as having no
-// credentials at all here, which is what makes resolveOrgSmsCredentials
-// (dispatch/sms.js) and getSenderPool (dispatch/senderId.js) fall back to
-// Haflaway's shared account/HAFLAWAY sender ID even if the resolved
-// provider name happens to match one the org has saved keys for.
+// place allowed to read the actual secret values back out. Not gated: only
+// resolveSmsRoute (dispatch/sms.js) decides, from the org's switch, whether
+// these are used.
 async function getCredentials(orgId, provider) {
-  if (!(await isBrandingApproved(orgId))) return null
   const snap = await credentialsDocRef(orgId, provider).get()
   return snap.exists ? snap.data() : null
 }

@@ -5,8 +5,11 @@
 // working unchanged — they only need a messageLogs/{requestId} doc with the
 // right fields.
 const { resolveEventTokens, refineMessage } = require('./messageTokens')
-const { DEFAULT_SENDER_ID } = require('./senderId')
-const { getCredentials } = require('../organizations/smsCredentials')
+const { DEFAULT_SENDER_ID, pickSenderId } = require('./senderId')
+const {
+  getCredentials, getConfiguredProviders, getSenderPool, getPlatformActiveProvider, resolveEffectiveProvider,
+} = require('../organizations/smsCredentials')
+const { getMessagingMode } = require('../organizations/messagingAccounts')
 
 // Standard SMS segment size (GSM-7 encoding, matches baseSMS pricing unit) —
 // 160, not the 153 a stale copy of this logic used (153 only applies to
@@ -115,50 +118,69 @@ async function getActiveSmsProvider(db) {
 
 const SUPPORTED_SMS_PROVIDERS = new Set(['beem', 'onfonmedia', 'wasambazie', 'smtz'])
 
-// smtz/wasambazie credentials are configurable per-organization from the SMS
-// Providers tab in OrganizationSettings.vue (owner brings their own account,
-// created directly with that provider — see organizations/smsCredentials.js
-// for the write path). An org that hasn't configured its own falls back to
-// the platform default, so unplugging an org's credentials reverts its very
-// next send to Haflaway's shared account with no other action needed. A
-// lookup failure (bad orgId, Firestore hiccup) also degrades to the default
-// rather than blocking the send, mirroring resolveSenderIdForEvent.
-async function resolveOrgSmsCredentials(orgId, providerName) {
-  if (orgId) {
-    try {
-      const data = await getCredentials(orgId, providerName)
-      if (data) {
-        if (providerName === 'smtz' && data.apiKey) {
-          return { apiKey: data.apiKey }
-        }
-        if (providerName === 'wasambazie' && data.publicKey && data.secretKey) {
-          return { publicKey: data.publicKey, secretKey: data.secretKey }
-        }
-      }
-    } catch (err) {
-      console.warn(`resolveOrgSmsCredentials: falling back to default for org ${orgId} (${providerName}):`, err.message)
+// THE routing decision for every SMS send batch (routes/campaigns.js calls
+// this once, before any message goes out). The org's staff-set switch
+// (organizations/messagingAccounts.js) is the only input that picks the
+// account:
+//
+//   'own'      → one of the org's own configured providers (smtz/wasambazie),
+//                its own credentials, and a sender ID from its own pool. No
+//                credentials, no sender ID, or anything unreadable → throws.
+//                Never falls back to Haflaway's account or the HAFLAWAY name.
+//   'haflaway' → the platform's active provider on Haflaway's own keys, as
+//                HAFLAWAY. The org's own credentials are never read.
+//
+// Returns { mode, providerName, credentials, senderId }; `credentials` is
+// passed straight to sendSmsCard (null for beem/onfonmedia, which only ever
+// run on Haflaway's keys).
+async function resolveSmsRoute(db, event) {
+  const mode = await getMessagingMode(event.orgId, 'sms')
+
+  if (mode === 'own') {
+    const refusal = 'This organization sends SMS only through its own provider account'
+    const configured = await getConfiguredProviders(event.orgId)
+    if (!configured.length) {
+      throw new Error(`${refusal}, but no smtz or wasambazie credentials are saved. Add them on the Organization page — nothing was sent.`)
     }
+    const platform = await getPlatformActiveProvider()
+    const providerName = resolveEffectiveProvider(configured, platform)
+    const [data, pool] = await Promise.all([
+      getCredentials(event.orgId, providerName),
+      getSenderPool(event.orgId, providerName),
+    ])
+    const credentials = providerName === 'smtz'
+      ? { apiKey: data?.apiKey }
+      : { publicKey: data?.publicKey, secretKey: data?.secretKey }
+    if (Object.values(credentials).some(v => !v)) {
+      throw new Error(`${refusal}, but its ${providerName} credentials are incomplete. Nothing was sent.`)
+    }
+    if (!pool.senderIds.length) {
+      throw new Error(`${refusal}, but it has no sender ID registered on ${providerName}. Add one on the Organization page — nothing was sent.`)
+    }
+    return { mode, providerName, credentials, senderId: pickSenderId(event.senderId, pool) }
   }
-  if (providerName === 'smtz') return { apiKey: process.env.SMTZ_API_KEY }
-  return { publicKey: process.env.WASAMBAZIE_PUBLIC_KEY, secretKey: process.env.WASAMBAZIE_SECRET_KEY }
+
+  const providerName = await getActiveSmsProvider(db)
+  let credentials = null
+  if (providerName === 'smtz') credentials = { apiKey: process.env.SMTZ_API_KEY }
+  if (providerName === 'wasambazie') credentials = { publicKey: process.env.WASAMBAZIE_PUBLIC_KEY, secretKey: process.env.WASAMBAZIE_SECRET_KEY }
+  return { mode, providerName, credentials, senderId: DEFAULT_SENDER_ID }
 }
 
-async function sendSmsCard({ providerName, message, attendeeId, phoneNumber, senderId, orgId }) {
+// `credentials` always comes from resolveSmsRoute — there is no lookup or
+// fallback in here, so a send can only ever go out on the account the route
+// decided.
+async function sendSmsCard({ providerName, credentials, message, attendeeId, phoneNumber, senderId }) {
   if (providerName === 'beem') return useBeem(message, attendeeId, phoneNumber, senderId)
   if (providerName === 'onfonmedia') return useOnFon(message, phoneNumber, senderId)
-  if (providerName === 'wasambazie') {
-    const { publicKey, secretKey } = await resolveOrgSmsCredentials(orgId, 'wasambazie')
-    return useWasambazie(message, phoneNumber, senderId, publicKey, secretKey)
-  }
-  if (providerName === 'smtz') {
-    const { apiKey } = await resolveOrgSmsCredentials(orgId, 'smtz')
-    return useSmtz(message, phoneNumber, senderId, apiKey)
-  }
+  if (providerName === 'wasambazie') return useWasambazie(message, phoneNumber, senderId, credentials?.publicKey, credentials?.secretKey)
+  if (providerName === 'smtz') return useSmtz(message, phoneNumber, senderId, credentials?.apiKey)
   throw new Error(`No SMS adapter for provider "${providerName}" — only ${[...SUPPORTED_SMS_PROVIDERS].join('/')} are implemented here.`)
 }
 
 module.exports = {
   sendSmsCard,
+  resolveSmsRoute,
   getActiveSmsProvider,
   resolveEventTokens,
   refineMessage,

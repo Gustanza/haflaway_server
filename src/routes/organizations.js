@@ -32,9 +32,9 @@ router.post('/organizations/:orgId/sms-credentials', requireAuth, requireOrgOwne
   }
 })
 
-// Unplugging — the org's next SMS send falls back to Haflaway's shared
-// credentials immediately (dispatch/sms.js re-reads on every send, nothing
-// cached).
+// Unplugging. An org whose SMS switch is 'own' can't send SMS at all until
+// credentials are back (dispatch/sms.js resolveSmsRoute refuses — it never
+// falls back to Haflaway's account); on 'haflaway' these were never used.
 router.delete('/organizations/:orgId/sms-credentials/:provider', requireAuth, requireOrgOwner, async (req, res) => {
   try {
     assertKnownProvider(req.params.provider)
@@ -108,8 +108,9 @@ router.post('/organizations/:orgId/twilio-credentials', requireAuth, requireOrgO
 })
 
 // Unplugging also wipes every template registered against these credentials
-// (see clearCredentials in organizations/twilioCredentials.js) — the org's
-// next WhatsApp send falls back to Haflaway's shared account immediately.
+// (see clearCredentials in organizations/twilioCredentials.js). An org whose
+// WhatsApp switch is 'own' can't send WhatsApp until they're back
+// (resolveWhatsAppRoute refuses — never falls back to Haflaway's account).
 router.delete('/organizations/:orgId/twilio-credentials', requireAuth, requireOrgOwner, async (req, res) => {
   try {
     const result = await clearTwilioCredentials(req.params.orgId)
@@ -120,8 +121,9 @@ router.delete('/organizations/:orgId/twilio-credentials', requireAuth, requireOr
 })
 
 // Never returns the secret values — only whether Twilio credentials are
-// configured and the (non-secret) template mapping. Any org member can read
-// this, matching the SMS status route's reasoning.
+// configured, when they were last updated, masked hints (AC••••1234; the
+// secret itself is bullets only) and the (non-secret) template mapping. Any
+// org member can read this, matching the SMS status route's reasoning.
 router.get('/organizations/:orgId/twilio-credentials/status', requireAuth, requireOrgMember, async (req, res) => {
   try {
     const status = await getTwilioStatus(req.params.orgId)
@@ -136,9 +138,9 @@ router.get('/organizations/:orgId/twilio-credentials/status', requireAuth, requi
 // there's no staff review step. Requires Twilio credentials to already be
 // configured (see setTemplate).
 router.post('/organizations/:orgId/whatsapp-templates', requireAuth, requireOrgOwner, async (req, res) => {
-  const { category, language, contentSid } = req.body || {}
+  const { category, language, contentSid, name, content, notes, active, previous } = req.body || {}
   try {
-    const result = await setTemplate(req.params.orgId, category, language, contentSid, req.uid)
+    const result = await setTemplate(req.params.orgId, category, language, contentSid, req.uid, { name, content, notes, active, previous })
     res.json({ ok: true, ...result })
   } catch (e) {
     res.status(400).json({ ok: false, message: e.message })

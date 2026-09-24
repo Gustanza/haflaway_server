@@ -15,16 +15,21 @@
 //   organizations/{orgId}/twilioCredentials/whatsapp — one doc:
 //     { accountSid, apiKeySid, apiKeySecret, whatsappSender, updatedAt, updatedBy }
 //   organizations/{orgId}/whatsappTemplates/{category}_{language} — one doc
-//   per (category, language) pair: { category, language, contentSid, addedAt, addedBy }
+//   per (category, language) pair: { category, language, contentSid, name,
+//   content, notes, active, addedAt, addedBy, updatedAt, updatedBy } — the
+//   same descriptive fields haflaway_admin_spa's WhatsAppTemplatesView.vue
+//   records for Haflaway's shared messageTemplates library.
 //
-// Consumption gate: exactly like smsCredentials.js — saving credentials and
-// templates isn't enough on its own, they only actually get used once staff
-// has approved that org's branding (organizations/{orgId}.brandingApproved).
-// isBrandingApproved is imported from smsCredentials.js rather than
-// re-implemented, since it's the same flag and the same read.
+// Consumption gate: saving credentials and templates isn't enough on its own —
+// they're only ever used once staff set this org's WhatsApp switch to 'own'
+// (organizations/messagingAccounts.js), and dispatch/whatsapp.js's
+// resolveWhatsAppRoute is the one place that decides that. The reads below
+// are deliberately ungated so that decision (and its "refuse, never fall
+// back" rule) lives in exactly one place.
 const { getDb, admin } = require('../firebase')
 const { isBrandingApproved } = require('./smsCredentials')
-const { WHATSAPP_TEMPLATE_CATEGORIES } = require('../dispatch/whatsappTemplateCategories')
+const { getMessagingModes } = require('./messagingAccounts')
+const { ORG_WHATSAPP_TEMPLATE_CATEGORIES } = require('../dispatch/whatsappTemplateCategories')
 
 const CREDENTIALS_SUBCOL = 'twilioCredentials'
 const CREDENTIALS_DOC_ID = 'whatsapp'
@@ -38,8 +43,8 @@ const TEMPLATES_SUBCOL = 'whatsappTemplates'
 const CREDENTIAL_FIELDS = ['accountSid', 'apiKeySid', 'apiKeySecret', 'whatsappSender']
 
 function assertKnownCategory(category) {
-  if (!WHATSAPP_TEMPLATE_CATEGORIES.includes(category)) {
-    throw new Error(`Unknown WhatsApp template category "${category}" — expected one of: ${WHATSAPP_TEMPLATE_CATEGORIES.join(', ')}.`)
+  if (!ORG_WHATSAPP_TEMPLATE_CATEGORIES.includes(category)) {
+    throw new Error(`Unknown WhatsApp template category "${category}" — expected one of: ${ORG_WHATSAPP_TEMPLATE_CATEGORIES.join(', ')}.`)
   }
 }
 
@@ -65,14 +70,39 @@ function isConfigured(data) {
   return !!data && CREDENTIAL_FIELDS.every(f => data[f])
 }
 
-// Always a full replace of exactly the four fields — never a partial merge of
-// the credential fields themselves, so rotating one leaves nothing stale
-// sitting alongside it. merge:true at the Firestore level only so this never
-// touches anything else that might one day live on this doc.
+// Masked hints for the status read so the form can show *that* each value is
+// saved without the value itself coming back: identifiers keep their 2-char
+// type prefix (AC/SK/MG) plus the last 4, the sender keeps its last 4, and the
+// secret reveals nothing but its presence.
+function maskValue(value, { prefix = 0, suffix = 4 } = {}) {
+  if (!value) return null
+  const s = String(value).replace(/^whatsapp:/, '')
+  if (s.length <= prefix + suffix) return '••••••••'
+  return `${s.slice(0, prefix)}••••••••${s.slice(-suffix)}`
+}
+
+function maskCredentials(data) {
+  if (!data) return null
+  return {
+    accountSid: maskValue(data.accountSid, { prefix: 2 }),
+    apiKeySid: maskValue(data.apiKeySid, { prefix: 2 }),
+    apiKeySecret: data.apiKeySecret ? '••••••••••••' : null,
+    whatsappSender: maskValue(data.whatsappSender, { prefix: /^MG/.test(data.whatsappSender) ? 2 : 0 }),
+  }
+}
+
+// Always writes all four fields together. A field left blank keeps its
+// currently saved value (so rotating just the secret doesn't mean re-pasting
+// the SIDs); with nothing saved yet, every field is required. merge:true at
+// the Firestore level only so this never touches anything else that might one
+// day live on this doc.
 async function setCredentials(orgId, credentials, updatedBy) {
+  const needsExisting = CREDENTIAL_FIELDS.some(f => !String(credentials?.[f] ?? '').trim())
+  const existingSnap = needsExisting ? await credentialsDocRef(orgId).get() : null
+  const existing = existingSnap?.exists ? existingSnap.data() : {}
   const doc = {}
   for (const field of CREDENTIAL_FIELDS) {
-    const value = String(credentials?.[field] ?? '').trim()
+    const value = String(credentials?.[field] ?? '').trim() || existing[field]
     if (!value) throw new Error(`${field} is required.`)
     doc[field] = value
   }
@@ -97,61 +127,53 @@ async function clearCredentials(orgId) {
 }
 
 // Never returns the secret values — only whether Twilio credentials are
-// configured, when they were last set, and the (non-secret) template
-// mapping — so credentials can't leak back out through the same read path
-// used to render the "Configured" badge.
+// configured, when they were last set, masked hints of each field (see
+// maskCredentials), and the (non-secret) template mapping — so credentials
+// can't leak back out through the same read path used to render the
+// "Configured" badge.
 async function getStatus(orgId) {
-  const [credSnap, templatesSnap, brandingApproved] = await Promise.all([
+  const [credSnap, templatesSnap, brandingApproved, modes] = await Promise.all([
     credentialsDocRef(orgId).get(),
     templatesCol(orgId).get(),
     isBrandingApproved(orgId),
+    getMessagingModes(orgId),
   ])
   const data = credSnap.exists ? credSnap.data() : null
   const templates = templatesSnap.docs.map(d => d.data())
   return {
     configured: isConfigured(data),
-    updatedAt: data?.updatedAt ?? null,
+    updatedAt: data?.updatedAt?.toDate?.().toISOString() ?? null,
+    masked: maskCredentials(data),
     templates,
     brandingApproved,
+    // 'own' | 'haflaway' — the staff-set switch that decides whose account
+    // this org's WhatsApp actually goes out on (organizations/messagingAccounts.js).
+    mode: modes.whatsapp,
   }
 }
 
-// Internal use only (dispatch/whatsapp.js) — the one place allowed to read
-// the actual secret values back out. Branding-gated: an unapproved org reads
-// as having no credentials at all here, so dispatch falls back to Haflaway's
-// shared Twilio account even if the org has valid keys saved.
+// Internal use only (dispatch/whatsapp.js, and the owner's test-send route) —
+// the one place allowed to read the actual secret values back out. Not gated
+// on anything: whether these may be used for a real send is decided solely by
+// resolveWhatsAppRoute (dispatch/whatsapp.js) from the org's switch.
 async function getCredentials(orgId) {
-  if (!(await isBrandingApproved(orgId))) return null
   const snap = await credentialsDocRef(orgId).get()
   const data = snap.exists ? snap.data() : null
   return isConfigured(data) ? data : null
 }
 
-// Same branding gate as getCredentials — a template only takes effect once
-// the org is approved, even though it can be registered (and test-sent)
-// before that.
+// The raw registered entry (active or not) — callers decide what an inactive
+// one means: real dispatch refuses it, the owner's test send still uses it.
 async function getTemplate(orgId, category, language) {
-  if (!(await isBrandingApproved(orgId))) return null
   const snap = await templatesCol(orgId).doc(templateDocId(category, language)).get()
   return snap.exists ? snap.data() : null
 }
 
-// Deliberately bypasses the branding-approval gate — used only by the
-// owner's own self-test-send route (routes/organizations.js), so they can
-// verify a template renders correctly *before* staff approval lands, without
-// that test ever being able to go out through Haflaway's shared account.
-// Never call this from real campaign dispatch (routes/campaigns.js) — that
-// path must always go through the gated getCredentials/getTemplate above.
-async function getCredentialsForOwnerTest(orgId) {
-  const snap = await credentialsDocRef(orgId).get()
-  const data = snap.exists ? snap.data() : null
-  return isConfigured(data) ? data : null
-}
-
-async function getTemplateForOwnerTest(orgId, category, language) {
-  const snap = await templatesCol(orgId).doc(templateDocId(category, language)).get()
-  return snap.exists ? snap.data() : null
-}
+// The owner's self-test-send route (routes/organizations.js) — same reads,
+// kept as named aliases so that route reads as clearly never touching
+// Haflaway's shared account.
+const getCredentialsForOwnerTest = getCredentials
+const getTemplateForOwnerTest = getTemplate
 
 // Owner-only self-service: the org already got this Content Template
 // approved directly with Twilio/Meta on their own account, so there's
@@ -159,23 +181,65 @@ async function getTemplateForOwnerTest(orgId, category, language) {
 // it's usable. Requires the org's own Twilio credentials to already be
 // configured, same precondition smsCredentials.js's addSenderId enforces —
 // a contentSid has no meaning without the account it was approved in.
-async function setTemplate(orgId, category, language, rawContentSid, addedBy) {
+//
+// `meta` carries the same descriptive fields as the shared library's
+// WhatsAppTemplatesView.vue form: name + display text (required), notes
+// (optional), active (defaults on). The doc id *is* (category, language), so:
+//   - adding (no meta.previous) refuses a slot that's already taken, rather
+//     than silently replacing whatever template was registered there;
+//   - editing passes meta.previous = { category, language } — the entry's
+//     current slot. If category/language changed, the entry moves: new doc
+//     written, old doc deleted, in one transaction, refusing a taken target
+//     slot. addedAt/addedBy carry over from the entry being edited.
+async function setTemplate(orgId, category, language, rawContentSid, addedBy, meta = {}) {
   assertKnownCategory(category)
   assertKnownLanguage(language)
   const contentSid = String(rawContentSid ?? '').trim()
   if (!contentSid) throw new Error('Enter a Content SID.')
+  const name = String(meta.name ?? '').trim()
+  if (!name) throw new Error('Enter a name for this template.')
+  const content = String(meta.content ?? '').trim()
+  if (!content) throw new Error('Enter the display text organizers will see in the send picker.')
+  const notes = String(meta.notes ?? '').trim() || null
+  const active = meta.active !== false
+  const previous = meta.previous ?? null
+  if (previous) {
+    assertKnownCategory(previous.category)
+    assertKnownLanguage(previous.language)
+  }
 
   const credSnap = await credentialsDocRef(orgId).get()
   if (!isConfigured(credSnap.exists ? credSnap.data() : null)) {
     throw new Error('Configure your own Twilio credentials above before registering a template.')
   }
 
-  await templatesCol(orgId).doc(templateDocId(category, language)).set({
-    category, language, contentSid,
-    addedAt: admin.firestore.FieldValue.serverTimestamp(),
-    addedBy,
+  const docRef = templatesCol(orgId).doc(templateDocId(category, language))
+  const prevRef = previous ? templatesCol(orgId).doc(templateDocId(previous.category, previous.language)) : null
+  const moving = !!prevRef && prevRef.id !== docRef.id
+
+  await getDb().runTransaction(async (tx) => {
+    const [targetSnap, prevSnap] = await Promise.all([
+      tx.get(docRef),
+      moving ? tx.get(prevRef) : Promise.resolve(null),
+    ])
+    if (targetSnap.exists && (!previous || moving)) {
+      throw new Error('You already have a template for that message type and language — edit or remove that one instead.')
+    }
+    if (previous && !(moving ? prevSnap : targetSnap).exists) {
+      throw new Error('That template no longer exists — it may have been removed. Close this and try again.')
+    }
+    const existing = moving ? prevSnap.data() : (targetSnap.exists ? targetSnap.data() : null)
+    const now = admin.firestore.FieldValue.serverTimestamp()
+    tx.set(docRef, {
+      category, language, contentSid, name, content, notes, active,
+      addedAt: existing?.addedAt ?? now,
+      addedBy: existing?.addedBy ?? addedBy,
+      updatedAt: now,
+      updatedBy: addedBy,
+    })
+    if (moving) tx.delete(prevRef)
   })
-  return { category, language, contentSid }
+  return { category, language, contentSid, name, content, notes, active }
 }
 
 async function removeTemplate(orgId, category, language) {

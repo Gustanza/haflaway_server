@@ -3,7 +3,8 @@ const { getAdmin } = require('../firebase')
 // Verifies a real Firebase ID token (Authorization: Bearer <idToken>) via the
 // Admin SDK — deliberately NOT the existing Cloud Functions' "Bearer <raw
 // uid>" pattern, which anyone could forge by just knowing/guessing a uid.
-// Attaches the verified uid to req.uid for handlers to use.
+// Attaches the verified uid to req.uid (and a verified email, if any, to
+// req.email) for handlers to use.
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || ''
   const idToken = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null
@@ -14,6 +15,8 @@ async function requireAuth(req, res, next) {
   try {
     const decoded = await getAdmin().auth().verifyIdToken(idToken)
     req.uid = decoded.uid
+    // Only a verified email is trusted for anything (see middleware/staffAccess.js).
+    req.email = decoded.email_verified ? String(decoded.email ?? '').toLowerCase() : null
     next()
   } catch (e) {
     res.status(401).json({ ok: false, message: `Invalid or expired ID token: ${e.message}` })

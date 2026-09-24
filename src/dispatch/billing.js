@@ -31,6 +31,7 @@ async function resolveBillingAccount(event) {
 async function chargeBilling({ billing, authorId, eventId, attendeeId, amount, reason, extraParams = {} }) {
   const db = getDb()
   const txnRef = db.collection('userTransactions').doc()
+  let balanceAfter
   await db.runTransaction(async (trn) => {
     const snap = await trn.get(billing.ref)
     const balance = snap.data()?.balance
@@ -46,7 +47,14 @@ async function chargeBilling({ billing, authorId, eventId, attendeeId, amount, r
       params: { attendeeId, ...extraParams },
       reason,
     })
+    balanceAfter = balance - amount
   })
+  // Keep the batch's in-memory copy current (it's read once per send run), so
+  // the next recipient's pre-send affordability check (assertAffordable in
+  // routes/campaigns.js) sees what's actually left — otherwise a run would
+  // keep sending real messages long after the balance ran out, and only fail
+  // to *bill* them.
+  billing.balance = balanceAfter
 }
 
 module.exports = { resolveBillingAccount, chargeBilling }

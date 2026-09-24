@@ -5,6 +5,7 @@ const healthRoutes = require('./routes/health')
 const cardsRoutes = require('./routes/cards')
 const campaignsRoutes = require('./routes/campaigns')
 const organizationsRoutes = require('./routes/organizations')
+const adminRoutes = require('./routes/admin')
 
 const app = express()
 app.use(cors())
@@ -17,6 +18,7 @@ app.use(healthRoutes)
 app.use(cardsRoutes)
 app.use(campaignsRoutes)
 app.use(organizationsRoutes)
+app.use(adminRoutes)
 
 const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {

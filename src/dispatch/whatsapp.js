@@ -8,7 +8,9 @@
 const twilio = require('twilio')
 const { parseISO } = require('date-fns')
 const { formatEventDate, formatEventTime, refineMessage } = require('./messageTokens')
-const { getCredentials: getOrgTwilioCredentials } = require('../organizations/twilioCredentials')
+const { getCredentials: getOrgTwilioCredentials, getTemplate: getOrgTemplate } = require('../organizations/twilioCredentials')
+const { getMessagingMode } = require('../organizations/messagingAccounts')
+const { WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE, GENERAL_WHATSAPP_TEMPLATE_CATEGORY } = require('./whatsappTemplateCategories')
 
 // Haflaway's own shared account — Account SID + Auth Token, cached as a
 // singleton since these never change at runtime. An org's own credentials
@@ -27,33 +29,102 @@ function platformTwilioClient() {
   return platformClient
 }
 
-// credentials is either null (use Haflaway's shared account) or an org's own
-// { accountSid, apiKeySid, apiKeySecret, whatsappSender } — resolved once per
-// send batch by resolveOrgWhatsAppCredentials below, gated on that org's
-// branding approval.
+// credentials is either null (Haflaway's shared account) or an org's own
+// { accountSid, apiKeySid, apiKeySecret, whatsappSender } — decided once per
+// send batch by resolveWhatsAppRoute below, never per message.
 function resolveTwilioClient(credentials) {
-  if (credentials?.accountSid && credentials?.apiKeySid && credentials?.apiKeySecret) {
+  if (credentials) {
+    if (!credentials.accountSid || !credentials.apiKeySid || !credentials.apiKeySecret) {
+      throw new Error("This organization's Twilio credentials are incomplete.")
+    }
     return twilio(credentials.apiKeySid, credentials.apiKeySecret, { accountSid: credentials.accountSid })
   }
   return platformTwilioClient()
 }
 
-// An org that's plugged in its own approved Twilio credentials AND has a
-// contentSid registered for the category/language being sent always sends
-// through its own account (see routes/campaigns.js, which resolves the
-// template and the credentials together — never mixing an org's account with
-// Haflaway's contentSid or vice versa, since a contentSid only exists inside
-// the account it was approved in). Returns null (meaning "use the shared
-// account") whenever the org hasn't brought its own, isn't approved, or a
-// lookup fails — mirrors resolveOrgSmsCredentials in dispatch/sms.js.
-async function resolveOrgWhatsAppCredentials(orgId) {
-  if (!orgId) return null
-  try {
-    return await getOrgTwilioCredentials(orgId)
-  } catch (err) {
-    console.warn(`resolveOrgWhatsAppCredentials: falling back to shared account for org ${orgId}:`, err.message)
-    return null
+// Delivery/read updates for sends on an org's own Twilio account: Haflaway's
+// own account has its status webhook configured in the Twilio console, but an
+// org's account doesn't, so those sends name the webhook per message instead
+// (updtWspMsgSttsAction only needs the MessageSid to find its messageLogs doc).
+const ORG_STATUS_CALLBACK_URL = process.env.TWILIO_ORG_STATUS_CALLBACK_URL
+  || 'https://us-central1-haflaway-f14aa.cloudfunctions.net/updtWspMsgSttsAction'
+
+// An org's sender is either a WhatsApp number or a Messaging Service SID
+// (MG…) — Twilio takes the former as `from: whatsapp:+…` and the latter as
+// `messagingServiceSid`. Accepts either with or without a `whatsapp:` prefix.
+function senderParams(sender) {
+  const value = String(sender ?? '').trim().replace(/^whatsapp:/i, '')
+  if (/^MG[0-9a-f]{32}$/i.test(value)) return { messagingServiceSid: value }
+  return { from: `whatsapp:${value}` }
+}
+
+function categoryLabel(purpose) {
+  return purpose ? purpose.replace(/_/g, ' ') : 'general (Bulk Messages)'
+}
+
+// The first active shared-library template for this category/language.
+async function findSharedTemplateId(db, category, language) {
+  const snap = await db.collection('messageTemplates')
+    .where('category', '==', category)
+    .where('language', '==', language)
+    .get()
+  const active = snap.docs.find(d => d.data().active !== false)
+  if (!active) throw new Error(`No approved WhatsApp template found for category "${category}" (${language}) — create one first.`)
+  return active.id
+}
+
+// THE routing decision for every WhatsApp send batch (routes/campaigns.js
+// calls this once, before any message goes out). The org's staff-set switch
+// (organizations/messagingAccounts.js) is the only input that picks the
+// account:
+//
+//   'own'      → the org's own Twilio credentials + the org's own active
+//                template for exactly this category/language. Anything
+//                missing, switched off, unreadable, or a request naming some
+//                other template → throws. Never falls back to Haflaway's.
+//   'haflaway' → Haflaway's shared account + a shared-library template
+//                (the one the caller picked, validated against
+//                messageTemplates, or the first active one for the purpose).
+//                The org's own credentials are never read.
+//
+// `purpose` is set for card sends and null for card-less Bulk Messages sends,
+// which use the general category.
+async function resolveWhatsAppRoute({ db, event, purpose, language, requestedTemplateId }) {
+  const mode = await getMessagingMode(event.orgId, 'whatsapp')
+  const category = purpose ? WHATSAPP_TEMPLATE_CATEGORY_BY_PURPOSE[purpose] : GENERAL_WHATSAPP_TEMPLATE_CATEGORY
+  if (!category) throw new Error(`No WhatsApp template category configured for purpose "${purpose}".`)
+  const which = `${categoryLabel(purpose)} (${String(language).toUpperCase()})`
+
+  if (mode === 'own') {
+    const refusal = 'This organization sends WhatsApp only through its own Twilio account'
+    const [credentials, template] = await Promise.all([
+      getOrgTwilioCredentials(event.orgId),
+      getOrgTemplate(event.orgId, category, language),
+    ])
+    if (!credentials) throw new Error(`${refusal}, but no Twilio credentials are saved. Add them on the Organization page — nothing was sent.`)
+    if (!template?.contentSid) throw new Error(`${refusal}, and it has no template of its own for ${which}. Add one on the Organization page — nothing was sent.`)
+    if (template.active === false) throw new Error(`${refusal}, and its template for ${which} is switched off. Turn it back on on the Organization page — nothing was sent.`)
+    if (requestedTemplateId && requestedTemplateId !== template.contentSid) {
+      throw new Error(`${refusal} — the selected template isn't its own template for ${which}. Nothing was sent.`)
+    }
+    return { mode, credentials, templateId: template.contentSid }
   }
+
+  if (requestedTemplateId) {
+    const snap = await db.collection('messageTemplates').doc(String(requestedTemplateId)).get()
+    if (!snap.exists) throw new Error("The selected template isn't one of Haflaway's registered WhatsApp templates. Nothing was sent.")
+    const tpl = snap.data()
+    if (tpl.active === false) throw new Error('The selected WhatsApp template is switched off. Nothing was sent.')
+    if (tpl.category && tpl.category !== category) {
+      throw new Error(`The selected WhatsApp template is for a different message type than ${which}. Nothing was sent.`)
+    }
+    if (tpl.language && tpl.language !== language) {
+      throw new Error(`The selected WhatsApp template is in a different language than this event (${String(language).toUpperCase()}). Nothing was sent.`)
+    }
+    return { mode, credentials: null, templateId: snap.id }
+  }
+  if (!purpose) throw new Error('Pick a WhatsApp template to send with.')
+  return { mode, credentials: null, templateId: await findSharedTemplateId(db, category, language) }
 }
 
 // WhatsApp Content API template variables reject newlines/tabs and runs of
@@ -84,7 +155,7 @@ function resolveLocationTime(timeStr, fallback) {
 // customMessage (var 8) is the organizer-authored free-text slot, already
 // refined through the shared token table so {{eventname}}/{{venue}}/etc. work
 // inside it exactly like they do in SMS.
-function buildContentVariables({ event, attendee, cardUrl, customMessage }) {
+function buildContentVariables({ event, attendee, cardUrl, cardName, customMessage }) {
   const dateString = event.startDate ?? event.calendar?.[0]?.eventDate
   const timeString = event.startDate ?? event.calendar?.[0]?.startTime
   const date = parseISO(dateString)
@@ -96,13 +167,18 @@ function buildContentVariables({ event, attendee, cardUrl, customMessage }) {
   const fTime = formatEventTime(venueTime, event.language, event.timeFormat)
   const fWorshipTime = formatEventTime(worshipTime, event.language, event.timeFormat)
 
-  const imago = cardUrl.split('.app/')[1]
-  if (!imago) throw new Error('Invalid cardUrl — could not derive the template image variable.')
+  // Card-less sends (Bulk Messages) send '' here, exactly as the old
+  // sendWhatsAppInvitationMessages Cloud Function did.
+  let imago = ''
+  if (cardUrl) {
+    imago = cardUrl.split('.app/')[1]
+    if (!imago) throw new Error('Invalid cardUrl — could not derive the template image variable.')
+  }
 
   const eventTokens = { eventname: event.title ?? '', venue: event.location ?? '', date: fDate, time: fTime }
   const refinedCustomMessage = refineMessage(
     event.id, attendee.fullName, attendee.id, customMessage ?? '',
-    cardUrl, undefined, attendee.pledgedAmount ?? 0, attendee.paidAmount ?? 0, eventTokens
+    cardUrl, cardName, attendee.pledgedAmount ?? 0, attendee.paidAmount ?? 0, eventTokens
   )
 
   return JSON.stringify({
@@ -119,20 +195,27 @@ function buildContentVariables({ event, attendee, cardUrl, customMessage }) {
   })
 }
 
-async function sendWhatsAppCard({ event, attendee, cardUrl, templateId, customMessage, credentials }) {
-  const contentVariables = buildContentVariables({ event, attendee, cardUrl, customMessage })
-  const whatsappNumber = credentials?.whatsappSender || process.env.TWILIO_WHATSAPP_NUMBER
-  if (!whatsappNumber) throw new Error('No WhatsApp sender configured (org has none, and TWILIO_WHATSAPP_NUMBER not set in .env).')
+// `credentials` comes from resolveWhatsAppRoute — an org's own (its own
+// sender, never Haflaway's number) or null (Haflaway's account and number).
+async function sendWhatsAppCard({ event, attendee, cardUrl, cardName, templateId, customMessage, credentials }) {
+  const contentVariables = buildContentVariables({ event, attendee, cardUrl, cardName, customMessage })
+  const sender = credentials ? credentials.whatsappSender : process.env.TWILIO_WHATSAPP_NUMBER
+  if (!sender) {
+    throw new Error(credentials
+      ? "This organization's Twilio credentials have no WhatsApp sender."
+      : 'TWILIO_WHATSAPP_NUMBER not set in .env.')
+  }
 
   // A hung connection here would otherwise stall this attendee (and the rest
   // of the run behind it) indefinitely.
   const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Twilio request timed out.')), 15000))
   const message = await Promise.race([
     resolveTwilioClient(credentials).messages.create({
-      from: `whatsapp:${whatsappNumber}`,
+      ...senderParams(sender),
       to: `whatsapp:${attendee.phone}`,
       contentSid: templateId,
       contentVariables,
+      ...(credentials ? { statusCallback: ORG_STATUS_CALLBACK_URL } : {}),
     }),
     timeout,
   ])
@@ -152,10 +235,10 @@ async function sendWhatsAppCard({ event, attendee, cardUrl, templateId, customMe
 
 // Synthetic placeholder values, not a real event/attendee — lets an org owner
 // confirm their own contentSid renders (right variable count/order) before
-// staff approval lands, without touching billing, messageLogs, or a real
-// guest. Always uses the org's own credentials (never the shared account) —
-// see getCredentialsForOwnerTest in organizations/twilioCredentials.js, which
-// deliberately skips the branding-approval gate for this one path.
+// staff switch them onto their own account, without touching billing,
+// messageLogs, or a real guest. Always uses the org's own credentials (never
+// the shared account) — see getCredentialsForOwnerTest in
+// organizations/twilioCredentials.js.
 function buildTestContentVariables() {
   return JSON.stringify({
     '1': 'Test Guest',
@@ -177,7 +260,7 @@ async function sendWhatsAppTestMessage({ credentials, contentSid, to }) {
   const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Twilio request timed out.')), 15000))
   const message = await Promise.race([
     resolveTwilioClient(credentials).messages.create({
-      from: `whatsapp:${credentials.whatsappSender}`,
+      ...senderParams(credentials.whatsappSender),
       to: `whatsapp:${to}`,
       contentSid,
       contentVariables,
@@ -187,4 +270,4 @@ async function sendWhatsAppTestMessage({ credentials, contentSid, to }) {
   return { sid: message.sid, status: message.status }
 }
 
-module.exports = { sendWhatsAppCard, sendWhatsAppTestMessage, resolveOrgWhatsAppCredentials }
+module.exports = { sendWhatsAppCard, sendWhatsAppTestMessage, resolveWhatsAppRoute }
